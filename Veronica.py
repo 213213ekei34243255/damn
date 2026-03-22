@@ -144,7 +144,7 @@ def get_gemini_response(user_question: str, session_id: str) -> str:
 
     # 3) Final prompt
     final_prompt = (
-        "You are Noah, the assistant for Christ Junior College.\n\n"
+        "You are Noah.\n\n"
         "Context:\n"
         f"{context}\n\n"
         f"User question: {user_question}"
