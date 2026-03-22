@@ -1,1 +1,32 @@
 
+{
+  "chunks": [
+    "Answer questions in 2-4 sentences , if the users question is not found in this context refer to the internet and answer general questions.",
+  ],
+  "metadata": {
+    "source": "veronica_combined_context",
+    "created_at": "2025-11-10T15:06:36.062073Z",
+    "chunk_count": 75,
+    "notes": "Split into paragraph/sentence chunks for retrieval"
+  }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
