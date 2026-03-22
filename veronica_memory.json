@@ -1,7 +1,7 @@
 
 {
   "chunks": [
-    "Answer questions in 2-4 sentences , if the users question is not found in this context refer to the internet and answer general questions.",
+    "Answer questions in 2-4 sentences , if the users question is not found in this context refer to the internet and answer general questions."
   ],
   "metadata": {
     "source": "veronica_combined_context",
