@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abraham Industries</title>
+    <link rel="icon" href="/favicon.png">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+    <style>
+        @media (max-width: 600px) {
+          #rid {
+            font-size: 2.4rem;
+          }
+        
+          #dynamic-word {
+            font-size: 2.4rem;
+          }
+        }
+        
+
+
+    </style>
+<body>
+    
+    <header class="header">
+        <a href="#" class="logo">
+            <img src="/static/asss.png" alt="Abraham Industries" style="height: 80px;">
+        </a>
+
+        <i class='bx bx-menu' id="menu-icon"></i>
+
+        <nav class="navbar">
+            <a href="/">Home</a>
+            <a href="/about">About</a>
+            <a href="/founders">Founders</a>
+            <a href="/cogniai">CogniAI Labs</a>
+            <a href="/contact">Contact</a>
+            <a href="/notification">Notifications</a>
+        </nav>
+    </header>
+    <section class="home" id="home">
+        <div class="home-content">
+            
+           
+            <h3 id ="rid">#EMPOWERING<span id="dynamic-word">BUSINESSES</span></h3>
+           
+                
+            
+              <p>“At Abraham Industries, we are not just building technology — we are empowering startups with intelligent AI to scale smarter, faster, and stronger.”</p>
+            <div class="social-media">
+                <a href="https://www.instagram.com/abrahamindustriesofficial?igshid=MWc5bnptbm1wcDQ2Zg==" style="--i:7;"><i class='bx bxl-instagram-alt'></i></a>
+                <a href="https://x.com/AbrahamIndustry?t=i-6cqiOk7ikG7gnZMNQ3AA&s=09" style="--i:8;"><i class='bx bxl-twitter'></i></a>
+                <a href="https://www.youtube.com/@AbrahamIndustries" style="--i:10;"><i class='bx bxl-youtube'></i></a>
+            </div>
+            
+            <a href="/about" class="btn">Get Started</a>
+        </div>
+        
+    </section>
+    <div class="container">
+        <div class="chatbox">
+            <div class="chatbox__support">
+                <div class="chatbox__header">
+                    <div class="chatbox__image--header">
+                        <img src="vai.png" alt="VAI">
+                    </div>
+                    <div class="chatbox__content--header">
+                        <h4 class="chatbox__heading--header">Veronica VAI</h4>
+                        <p class="chatbox__description--header">VAI-6.5</p>
+                    </div>
+                </div>
+                <div class="chatbox__messages">
+                    <div></div>
+                </div>
+                <div class="chatbox__footer">
+                    <input type="text" placeholder="Write a message...">
+                    <button class="chatbox__send--footer send__button">Send</button>
+                </div>
+            </div>
+            <div class="chatbox__button">
+                <button><img src="vai.png" alt="VA"></button>
+            </div>
+        </div>
+    </div>
+    <script>
+        const words = ["BUSINESSES", "STARTUPS", "GROWTH", "INNOVATION"];
+        let wordIndex = 0;
+        let charIndex = 0;
+        let isDeleting = false;
+        const span = document.getElementById("dynamic-word");
+        
+        function typeEffect() {
+            const currentWord = words[wordIndex];
+            if (isDeleting) {
+                charIndex--;
+                span.textContent = currentWord.substring(0, charIndex);
+                if (charIndex === 0) {
+                    isDeleting = false;
+                    wordIndex = (wordIndex + 1) % words.length;
+                }
+            } else {
+                charIndex++;
+                span.textContent = currentWord.substring(0, charIndex);
+                if (charIndex === currentWord.length) {
+                    isDeleting = true;
+                }
+            }
+            setTimeout(typeEffect, isDeleting ? 60 : 200);
+        }
+        
+        typeEffect();
+    </script>
+    
+    
+
+
+   
+    
+    
+    
+    
+    
+    
+   <script src="https://smtpjs.com/v3/smtp.js"></script>
+   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>        
+   <script src ="script.js"></script>      
+  
+</body>

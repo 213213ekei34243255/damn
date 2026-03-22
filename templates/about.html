@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abraham Industries</title>
+    <link rel="icon" href="/favicon.png">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+    <style>
+        .chatbox__image--header img {
+            width: 40px;  /* Adjust size as needed */
+            height: 40px; 
+            border-radius: 50%; /* Makes it circular */
+            object-fit: cover; /* Ensures the image fits well */
+        }
+        p {
+            font-size: 18px; /* Default for desktop */
+            line-height: 1.6;
+        }
+        @media (max-width: 768px) {
+            p {
+                font-size: 16px; /* Smaller font for mobile */
+                text-align: justify;
+            }
+        }
+        .about-content {
+            max-width: 800px;
+            margin: auto;
+            padding: 20px;
+        }
+        @media (max-width: 768px) {
+            .about-content {
+                padding: 10px;
+            }
+        }
+        .about-img img {
+            width: 100%;
+            height: auto;
+        }
+        @media (max-width: 768px) {
+            .about-img img {
+                display: block;
+                margin: auto;
+            }
+        }
+        .about-img img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        
+        .about-content {
+            padding: 20px;
+            text-align: justify;
+        }
+        
+        @media (max-width: 768px) {
+            .about-img img {
+                width: 100%;
+                height: auto;
+            }
+        
+            .about-content {
+                padding: 15px;
+            }
+        }
+        .about {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            max-width: none;
+            width:100%;
+            margin: auto;
+            padding: 50px 20px;
+        }
+        
+        /* Desktop: Image Left, Text Right */
+        .about-img {
+            flex: 1;
+            padding-right: 20px;
+        }
+        
+        .about-img img {
+            width: 70%;
+            height: 30%;
+            display: block;
+        }
+        
+        .about-content {
+            flex: 2;
+            text-align: justify;
+        }
+        
+        /* Mobile: Image on Top, Text Below */
+        @media (max-width: 768px) {
+            .about {
+                flex-direction: column;
+                text-align: center;
+            }
+        
+            .about-img {
+                padding-right: 0;
+                margin-bottom: 20px;
+            }
+        
+            .about-content {
+                padding: 10px;
+            }
+        }
+        .logo{
+            color:black;
+        }
+        .navbar a {
+            color: black ;
+        }
+        @media (max-width: 768px) {
+            .navbar a {
+              color: white !important; /* adjust this value to your preference */
+            }
+        }
+        @media (max-width: 768px) {
+            .about-img {
+              margin-top: 30px; /* adjust this value to your preference */
+            }
+        }
+        #menu-icon{
+            color:black;
+        }
+    </style>
+
+<body>
+    <header class="header">
+        <a href="#" class="logo">
+            <img src="/static/as.png" alt="Abraham Industries" style="height: 70px;">
+        </a>
+
+        <i class='bx bx-menu' id="menu-icon"></i>
+
+        <nav class="navbar">
+            <a href="/">Home</a>
+            <a href="/about">About</a>
+            <a href="/founders">Founders</a>
+            <a href="/cogniai">CogniAI Labs</a>
+            <a href="/contact">Contact</a>
+            <a href="/notification">Notifications</a>
+        </nav>
+    </header>
+    <section class="about" id="about">
+        <div class="about-img">
+            <img src="/img.png" alt="">
+            </div>
+            <div class="about-content">
+                <h2 class="heading"><span></span></h2>
+                <h3>History</h3>
+                <p>
+                    Abraham Industries was officially founded on February 6, 2024, born from a deep understanding of a major challenge faced by countless startups—failure due to weak marketing strategies, inefficient data handling, and the lack of scalable tech solutions. Witnessing how promising businesses with the potential to transform the country were falling short, Abraham Shaun Sunil  from India, set out to build something revolutionary.
+
+                    He recognized that many ventures, despite having strong ideas, struggled to grow because they lacked the tools and insights to operate efficiently in a competitive environment. To solve this, Shaun envisioned an AI-powered solution that would empower startups and businesses by managing their data, marketing, and operational processes through a centralized, intelligent system.
+
+                    With co-founders Alwin Devasia and Ansuman Bhattacharjee, Abraham Industries was created as a B2B technology company offering AI models installed directly into client infrastructures. These models not only streamline business tasks but also offer guidance and training, ensuring startups can grow sustainably. The long-term vision is to scale this model globally, becoming a trusted partner in startup success across borders.
+
+                    
+                    
+                    </p>
+                    
+            </div>
+    </section>
+    <div class="container">
+        <div class="chatbox">
+            <div class="chatbox__support">
+                <div class="chatbox__header">
+                    <div class="chatbox__image--header">
+                        <img src="vai.png" alt="VAI">
+                    </div>                    
+                    <div class="chatbox__content--header">
+                        <h4 class="chatbox__heading--header">Veronica VAI</h4>
+                        <p class="chatbox__description--header">VAI-6.5</p>
+                    </div>
+                </div>
+                <div class="chatbox__messages">
+                    <div></div>
+                </div>
+                <div class="chatbox__footer">
+                    <input type="text" placeholder="Write a message...">
+                    <button class="chatbox__send--footer send__button">Send</button>
+                </div>
+            </div>
+            <div class="chatbox__button">
+                <button><img src="vai.png" alt="VA"></button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://smtpjs.com/v3/smtp.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>        
+    <script src ="script.js"></script>      
+    
+ </body>

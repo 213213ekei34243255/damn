@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abraham Industries</title>
+    <link rel="icon" href="/favicon.png">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .blue-box {
+            background-color:rgb(255, 255, 255);
+            color: black;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            margin-top: 10px;
+            transition: box-shadow 0.3s ease-in-out;
+        }
+        
+        .blue-box:hover {
+            box-shadow: 0px 0px 20px rgba(8, 33, 250, 0.8); /* Black light effect */
+        }
+        .founders {
+            text-align: center;
+            padding: 100px 50px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .founder-box {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .founder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            max-width: 300px;
+        }
+        .founder-img img {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            object-fit: cover;
+        }
+        .section-title {
+            font-size: 32px;
+            margin-bottom: 20px;
+        }
+        .founder-info {
+            width: 250px; /* Adjust as needed */
+            min-height: 100px; /* Ensures equal height */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+    </style>
+</head>
+
+<body>
+    <header class="header">
+        <a href="#" class="logo">
+            <img src="/static/asss.png" alt="Abraham Industries" style="height: 80px;">
+        </a>
+
+        <i class='bx bx-menu' id="menu-icon"></i>
+
+        <nav class="navbar">
+            <a href="/">Home</a>
+            <a href="/about">About</a>
+            <a href="/founders">Founders</a>
+            <a href="/cogniai">CogniAI Labs</a>
+            <a href="/contact">Contact</a>
+            <a href="/notification">Notifications</a>
+        </nav>
+    </header>
+
+    <section class="founders" id="founders">
+        <h3 class="section-title">Meet Our Founders</h3>
+
+        <div class="founder-box">
+            <div class="founder">
+                <div class="founder-img"><img src="shaun.jpg" alt="Shaun"></div>
+                <div class="founder-info blue-box">
+                    <h4>Abraham Shaun Sunil</h4>
+                    <p>CEO & Founder of Abraham Industries</p>
+                    <p>Working as programmer in Bangalore, India</p>
+                </div>
+            </div>
+
+            <div class="founder">
+                <div class="founder-img"><img src="alwin.jpg" alt="Alwin"></div>
+                <div class="founder-info blue-box">
+                    <h4>Alwin Devasia</h4>
+                    <p>CMO & Co-Founder of Abraham Industries</p>
+                    <p>Working in Amma's Care Services in Brisbane, Australia</p>
+                </div>
+            </div>
+
+            <div class="founder">
+                <div class="founder-img"><img src="ansuman.jpg" alt="Ansuman"></div>
+                <div class="founder-info blue-box">
+                    <h4>Ansuman Bhattacharjee</h4>
+                    <p>CTO & Co-Founder of Abraham Industries</p>
+                    <p>Electrical Engineer and Data Analyst  in Delhi, India</p>
+                </div>
+            </div>
+        </div>
+    </section>
+    <div class="container">
+        <div class="chatbox">
+            <div class="chatbox__support">
+                <div class="chatbox__header">
+                    <div class="chatbox__image--header">
+                        <img src="vai.png" alt="VAI">
+                    </div>
+                    <div class="chatbox__content--header">
+                        <h4 class="chatbox__heading--header">Veronica VAI</h4>
+                        <p class="chatbox__description--header">VAI-6.5</p>
+                    </div>
+                </div>
+                <div class="chatbox__messages">
+                    <div></div>
+                </div>
+                <div class="chatbox__footer">
+                    <input type="text" placeholder="Write a message...">
+                    <button class="chatbox__send--footer send__button">Send</button>
+                </div>
+            </div>
+            <div class="chatbox__button">
+                <button><img src="vai.png" alt="VA"></button>
+            </div>
+        </div>
+    </div>
+
+    
+    
+
+
+   
+    
+    
+    
+    
+    
+
+   <script src="https://smtpjs.com/v3/smtp.js"></script>
+   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>        
+   <script src ="script.js"></script>      
+  
+</body>
