@@ -96,7 +96,7 @@ def save_message(session_id: str, role: str, text: str) -> None:
     redis_client.expire(key, 7 * 24 * 60 * 60)
 
 
-def load_history(session_id: str, limit: int = 3):
+def load_history(session_id: str, limit: int = 5):
     """
     Load the last `limit` messages from Redis.
     Returns: List[Dict] -> {role, text}
@@ -124,7 +124,7 @@ def get_gemini_response(user_question: str, session_id: str) -> str:
     hits = util.semantic_search(
         user_emb,
         chunk_embs_tensor,
-        top_k=3
+        top_k=5
     )[0]
 
     retrieved_chunks = [
