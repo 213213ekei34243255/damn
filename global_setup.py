@@ -8,14 +8,25 @@ model_embed = SentenceTransformer("all-MiniLM-L6-v2")
 
 def load_memory_and_precompute(memory_path="veronica_memory.json", emb_path="chunk_embs.npy"):
     mem_file = Path(memory_path)
+
+    if not mem_file.exists():
+        return [], np.array([])
+
     data = json.loads(mem_file.read_text(encoding="utf-8"))
-    chunks = data.get("chunks", [])
 
-    emb_file = Path(emb_path)
+    # 🔥 FIX: support BOTH formats (chunks OR structured JSON)
+    if "chunks" in data:
+        chunks = data.get("chunks", [])
+    else:
+        # convert structured JSON → text chunks
+        chunks = [json.dumps(data)]
 
-    # Recompute ONLY if memory changed (optional improvement)
+    if not chunks:
+        return [], np.array([])
+
     chunk_embs = model_embed.encode(chunks, convert_to_tensor=False)
-    np.save(emb_file, chunk_embs)
+
+    np.save(emb_path, chunk_embs)
 
     return chunks, chunk_embs
 
