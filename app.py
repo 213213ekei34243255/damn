@@ -131,7 +131,7 @@ def log_request():
     app.logger.debug("Headers: %s", dict(request.headers))
 
 # /predict route: explicit OPTIONS + POST handling
-@app.route("/predict", methods=["OPTIONS", "POST"], strict_slashes=False)
+@app.route("/predict", methods=["GET", "OPTIONS", "POST"], strict_slashes=False)
 def predict():
     # Preflight: securely respond with CORS headers if origin trusted
     if request.method == "OPTIONS":
