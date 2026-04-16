@@ -10,13 +10,13 @@ def load_memory_and_precompute(memory_path="veronica_memory.json", emb_path="chu
     mem_file = Path(memory_path)
     data = json.loads(mem_file.read_text(encoding="utf-8"))
     chunks = data.get("chunks", [])
-    # compute & save embeddings only if not present
+
     emb_file = Path(emb_path)
-    if emb_file.exists():
-        chunk_embs = np.load(emb_path)
-    else:
-        chunk_embs = model_embed.encode(chunks, convert_to_tensor=False)  # returns numpy array
-        np.save(emb_path, chunk_embs)
+
+    # Recompute ONLY if memory changed (optional improvement)
+    chunk_embs = model_embed.encode(chunks, convert_to_tensor=False)
+    np.save(emb_file, chunk_embs)
+
     return chunks, chunk_embs
 
 # At app startup:
