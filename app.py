@@ -254,9 +254,9 @@ def predict():
 
         return jsonify({"answer": response}), 200
 
-    except Exception:
+    except Exception as e:
         app.logger.exception("Error in /predict")
-        return jsonify({"error": "An unexpected error occurred."}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 
