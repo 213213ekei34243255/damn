@@ -151,6 +151,7 @@ def predict():
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
         url = request_data.get('url')
         
+        
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
 
         if not text:
@@ -237,6 +238,9 @@ def predict():
 
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
+        page_content = request_data.get("page_content", "")
+        if page_content:
+            text = f"Page Content:\n{page_content[:3000]}\n\nUser Question:\n{text}"
         # --- AI RESPONSE (session-aware with Redis + Gemini) ---
         response = get_veronica_response(
             user_question=text,
