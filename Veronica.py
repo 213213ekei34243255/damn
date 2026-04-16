@@ -143,12 +143,20 @@ def get_gemini_response(user_question: str, session_id: str) -> str:
         history_text += f"{prefix}: {msg['text']}\n"
 
     # 3) Final prompt
-    final_prompt = (
-        "You are Noah.\n\n"
-        "Context:\n"
-        f"{context}\n\n"
-        f"User question: {user_question}"
-    )
+    final_prompt = f"""
+        You are Noah, an AI assistant inside the Jonah Browser.
+        
+        Here is the conversation so far:
+        {history_text}
+        
+        Relevant context:
+        {context}
+        
+        Current user question:
+        {user_question}
+        
+        Answer clearly based on the conversation.
+        """
 
     try:
         model = genai.GenerativeModel(
