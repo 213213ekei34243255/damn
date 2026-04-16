@@ -129,7 +129,14 @@ def get_veronica_response_from_knowledge_or_gemini(text, session_id):
 def log_request():
     app.logger.debug("Incoming %s %s", request.method, request.url)
     app.logger.debug("Headers: %s", dict(request.headers))
+from googlesearch import search
 
+def search_internet(query):
+    try:
+        results = list(search(query, num_results=3))
+        return "\n".join(results)
+    except:
+        return ""
 # /predict route: explicit OPTIONS + POST handling
 @app.route("/predict", methods=["GET", "OPTIONS", "POST"], strict_slashes=False)
 def predict():
@@ -239,8 +246,11 @@ def predict():
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
         page_content = request_data.get("page_content", "")
+        internet_data = ""
         if page_content:
             text = f"Page Content:\n{page_content[:3000]}\n\nUser Question:\n{text}"
+        if not page_content:
+            internet_data = search_internet(text)
         # --- AI RESPONSE (session-aware with Redis + Gemini) ---
         response = get_veronica_response(
             user_question=text,
