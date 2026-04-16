@@ -258,6 +258,7 @@ def predict():
         {text}
         """
         elif internet_data:
+            internet_data = internet_data[:2000] 
             text = f"""
         Internet Results:
         {internet_data}
