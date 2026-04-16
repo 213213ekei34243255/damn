@@ -118,10 +118,10 @@ def fetch_all_conversations():
 init_db()
 
 # Optional: helper to call Gemini if needed (kept from your code)
-def get_veronica_response_from_knowledge_or_gemini(text):
-    resp = get_veronica_response(text, knowledge_base)
+def get_veronica_response_from_knowledge_or_gemini(text, session_id):
+    resp = get_veronica_response(text, knowledge_base, session_id)
     if resp == "Sorry I dont know what you are talking about! ^.^":
-        resp = get_gemini_response(text)
+        resp = get_gemini_response(text, session_id)
     return resp
 
 # DEBUG: log incoming requests (helps see if preflight reaches Flask)
