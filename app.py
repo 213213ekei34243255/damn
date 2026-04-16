@@ -247,10 +247,25 @@ def predict():
 
         page_content = request_data.get("page_content", "")
         internet_data = ""
-        if page_content:
-            text = f"Page Content:\n{page_content[:3000]}\n\nUser Question:\n{text}"
         if not page_content:
             internet_data = search_internet(text)
+        if page_content:
+            text = f"""
+        Page Content:
+        {page_content[:3000]}
+        
+        User Question:
+        {text}
+        """
+        elif internet_data:
+            text = f"""
+        Internet Results:
+        {internet_data}
+        
+        User Question:
+        {text}
+        """
+        
         # --- AI RESPONSE (session-aware with Redis + Gemini) ---
         response = get_veronica_response(
             user_question=text,
