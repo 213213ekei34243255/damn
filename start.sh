@@ -1,24 +1,73 @@
 #!/bin/bash
+set -e
 
-# Exit early on errors
-set -eu
+export LD_LIBRARY_PATH=/opt/llama:$LD_LIBRARY_PATH
 
-# Python buffers stdout. Without this, you won't see what you "print" in the Activity Logs
-export PYTHONUNBUFFERED=true
+MODEL_DIR="/var/data/models"
+MODEL_FILE="$MODEL_DIR/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
-# Install Python 3 virtual env
-VIRTUALENV=.data/venv
+mkdir -p "$MODEL_DIR"
 
-if [ ! -d $VIRTUALENV ]; then
-  python3 -m venv $VIRTUALENV
+if [ ! -f "$MODEL_FILE" ]; then
+    echo "========================================"
+    echo "Downloading Qwen model..."
+    echo "========================================"
+
+    curl -L -C - \
+        "$MODEL_URL" \
+        -o "$MODEL_FILE"
+
+    echo "========================================"
+    echo "Model download complete."
+    echo "========================================"
 fi
 
-if [ ! -f $VIRTUALENV/bin/pip ]; then
-  curl --silent --show-error --retry 5 https://bootstrap.pypa.io/get-pip.py | $VIRTUALENV/bin/python
+echo "========================================"
+echo "Starting llama-server..."
+echo "========================================"
+
+/opt/llama/llama-server \
+    -m "$MODEL_FILE" \
+    --host 127.0.0.1 \
+    --port 8080 \
+    > /tmp/llama.log 2>&1 &
+
+LLAMA_PID=$!
+
+echo "Waiting for llama-server to load the model..."
+
+for i in {1..120}; do
+    if curl -s http://127.0.0.1:8080/health >/dev/null 2>&1; then
+        echo "✓ llama-server is ready."
+        break
+    fi
+
+    if ! kill -0 $LLAMA_PID 2>/dev/null; then
+        echo "❌ llama-server exited unexpectedly."
+        echo "----- llama-server log -----"
+        cat /tmp/llama.log
+        exit 1
+    fi
+
+    sleep 2
+done
+
+if ! curl -s http://127.0.0.1:8080/health >/dev/null 2>&1; then
+    echo "❌ Timed out waiting for llama-server."
+    echo "----- llama-server log -----"
+    cat /tmp/llama.log
+    exit 1
 fi
 
-# Install the requirements
-$VIRTUALENV/bin/pip install -r requirements.txt
+echo "========================================"
+echo "llama-server is ready."
+echo "Starting Gunicorn..."
+echo "========================================"
 
-# Run a glorious Python 3 server
-$VIRTUALENV/bin/python3 app.py
+exec gunicorn app:app \
+    --bind 0.0.0.0:${PORT} \
+    --workers 1 \
+    --threads 4 \
+    --worker-class gthread \
+    --timeout 120
