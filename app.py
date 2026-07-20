@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, send_from_directory, make_response, send_file
-from Veronica import get_veronica_response, load_knowledge_base, save_knowledge_base, get_gemini_response
+from Veronica import get_veronica_response, load_knowledge_base, save_knowledge_base
 from flask_cors import CORS
 import os
 import google.generativeai as genai
@@ -21,7 +21,9 @@ ALLOWED_ORIGINS = {
     "https://christjuniorcollege.in",
     "https://www.christjuniorcollege.in",
     "https://byncai.net",
-    "https://www.byncai.net"
+    "https://www.byncai.net",
+    "https://www.cogniaistudios.com",
+    "https://cogniaistudios.com"
 }
 
 # Enable CORS (helps for simple cases; explicit OPTIONS handling below is the key)
@@ -31,14 +33,7 @@ CORS(app, resources={r"/predict": {"origins": list(ALLOWED_ORIGINS)}}, methods=[
 knowledge_base = load_knowledge_base('knowledge_base.json')
 
 # Configure the Gemini model from environment variable (do not hardcode keys)
-api_key = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    raise EnvironmentError(
-        "GEMINI_API_KEY not found in environment variables"
-    )
-
-genai.configure(api_key=api_key)
 
 # Optional: helper to call Gemini if needed (kept from your code)
 DATABASE_URL = os.environ.get('DATABASE_URL')  # expected to be provided in environment
@@ -118,10 +113,10 @@ def fetch_all_conversations():
 init_db()
 
 # Optional: helper to call Gemini if needed (kept from your code)
-def get_veronica_response_from_knowledge_or_gemini(text, session_id):
-    resp = get_veronica_response(text, knowledge_base, session_id)
+def get_veronica_response_from_knowledge_or_gemini(text):
+    resp = get_veronica_response(text, knowledge_base)
     if resp == "Sorry I dont know what you are talking about! ^.^":
-        resp = get_gemini_response(text, session_id)
+        resp = get_gemini_response(text)
     return resp
 
 # DEBUG: log incoming requests (helps see if preflight reaches Flask)
@@ -129,16 +124,9 @@ def get_veronica_response_from_knowledge_or_gemini(text, session_id):
 def log_request():
     app.logger.debug("Incoming %s %s", request.method, request.url)
     app.logger.debug("Headers: %s", dict(request.headers))
-from googlesearch import search
 
-def search_internet(query):
-    try:
-        results = list(search(query, num_results=3))
-        return "\n".join(results)
-    except:
-        return ""
 # /predict route: explicit OPTIONS + POST handling
-@app.route("/predict", methods=["GET", "OPTIONS", "POST"], strict_slashes=False)
+@app.route("/predict", methods=["OPTIONS", "POST"], strict_slashes=False)
 def predict():
     # Preflight: securely respond with CORS headers if origin trusted
     if request.method == "OPTIONS":
@@ -157,7 +145,6 @@ def predict():
         # session id may be sent by widget (optional)
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
         url = request_data.get('url')
-        
         
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
 
@@ -200,7 +187,7 @@ def predict():
             "pu academics": ("Open PU Academics", cj_base + "academics.php"),
             "faculty": ("Open Faculty", cj_base + "faculty.php"),
             "pu programs": ("Open PU Programs", cj_base + "pre-university-course.php#academic-programs"),
-            "admission pu": ("Open PU Admission", cj_base + "admission-pu.php"),
+            "pu admission": ("Open PU Admission", "https://kp.christjuniorcollege.in/CJC/cjcUniqueIdRegistration.do?method=initOnlineApplicationRegistration&pt=1"),
             "enquiry pu": ("Open PU Admission Enquiry", cj_base + "admission-enquiry-pu.php"),
             "pu faqs": ("Open PU FAQs", cj_base + "faqs-pu.php"),
             "student life": ("Open Student Life", cj_base + "student-life.php"),
@@ -224,7 +211,7 @@ def predict():
             query = " ".join(words[1:]).strip()
 
             for key, (label, url_map) in mapping.items():
-                if key in query:
+                if all(word in query for word in key.split()):
                     # log user and bot
                     try:
                         db_insert_message(session_id, 'user', text, reply_id=None, url=url, user_agent=user_agent)
@@ -245,28 +232,6 @@ def predict():
 
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
-        page_content = request_data.get("page_content", "")
-        internet_data = ""
-        if not page_content:
-            internet_data = search_internet(text)
-        if page_content:
-            text = f"""
-        Page Content:
-        {page_content[:3000]}
-        
-        User Question:
-        {text}
-        """
-        elif internet_data:
-            internet_data = internet_data[:2000] 
-            text = f"""
-        Internet Results:
-        {internet_data}
-        
-        User Question:
-        {text}
-        """
-        
         # --- AI RESPONSE (session-aware with Redis + Gemini) ---
         response = get_veronica_response(
             user_question=text,
@@ -284,9 +249,9 @@ def predict():
 
         return jsonify({"answer": response}), 200
 
-    except Exception as e:
+    except Exception:
         app.logger.exception("Error in /predict")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
 
 
@@ -374,4 +339,5 @@ def save():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    
     app.run(host='0.0.0.0', port=port, debug=True)
