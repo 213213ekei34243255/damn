@@ -7,15 +7,10 @@ from pathlib import Path
 import google.generativeai as genai
 import re
 
-# Configure the Gemini model with the API key
-api_key = os.getenv("GEMINI_API_KEY")
+from openai import OpenAI
 
-if not api_key:
-    raise EnvironmentError(
-        "GEMINI_API_KEY not found in environment variables"
-    )
+# Initialize DeepSeek client
 
-genai.configure(api_key=api_key)
 
 # Function to load the knowledge base from a JSON file
 def load_knowledge_base(file_path: str) -> dict:
@@ -110,96 +105,123 @@ def load_history(session_id: str, limit: int = 5):
 # --------------------
 # Main Gemini + RAG
 # --------------------
-def get_gemini_response(user_question: str, session_id: str) -> str:
-    # 1) Encode user query
+
+import requests
+
+LLAMA_URL = "http://127.0.0.1:8080/v1/chat/completions"
+
+
+def get_llama_response(user_question: str, session_id: str) -> str:
+
+    # Encode query
     user_emb = model_embed.encode(
         user_question,
         convert_to_tensor=True
     )
 
-    # Convert stored numpy embeddings → torch tensor
     chunk_embs_tensor = torch.tensor(CHUNK_EMBS)
 
-    # Semantic search
     hits = util.semantic_search(
         user_emb,
         chunk_embs_tensor,
-        top_k=5
+        top_k=20
     )[0]
 
     retrieved_chunks = [
-        CHUNKS[h["corpus_id"]] for h in hits
+        CHUNKS[h["corpus_id"]]["text"]
+        for h in hits
     ]
 
-    MAX_CONTEXT_CHARS = 1200
-    context = "\n".join(retrieved_chunks).strip()[:MAX_CONTEXT_CHARS]
+    context = "\n\n".join(
+        c["text"] if isinstance(c, dict) else str(c)
+        for c in retrieved_chunks
+    )
 
-    # 2) Load chat history
-    history = load_history(session_id, limit=3)
+    history = load_history(session_id, limit=8)
 
-    history_text = ""
-    for msg in history:
-        prefix = "User" if msg["role"] == "user" else "Veronica"
-        history_text += f"{prefix}: {msg['text']}\n"
-
-    # 3) Final prompt
-    final_prompt = f"""
-        You are Noah, an AI assistant inside the Jonah Browser.
-        
-        Here is the conversation so far:
-        {history_text}
-        
-        Relevant context:
-        {context}
-        
-        Current user question:
-        {user_question}
-        
-        Answer clearly based on the conversation.
+    messages = [
+        {
+            "role": "system",
+            "content": """
+           "You are Noah, Working in Jonah Browser you were made by CogniAI Studios , and your architecture is Rexy 1\n"
+            "Answer all the questions asked by the user check Internet and then answer web related answers have modern american language like bruh and then being too human way"
         """
+        }
+    ]
+
+    if context:
+        messages.append({
+            "role": "system",
+            "content": f"Knowledge Base:\n{context}"
+        })
+
+    for m in history:
+        messages.append({
+            "role": m["role"],
+            "content": m["text"]
+        })
+
+    messages.append({
+        "role": "user",
+        "content": user_question
+    })
+
+    payload = {
+        "model": "local",
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 512
+    }
 
     try:
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config={
-                "temperature": 0.7,
 
-            }
+        r = requests.post(
+            LLAMA_URL,
+            json=payload,
+            timeout=120
         )
 
-        # Rebuild Gemini chat with stored history
-        gemini_history = [
-            {
-                "role": "user" if m["role"] == "user" else "model",
-                "parts": [m["text"]],
-            }
-            for m in history
-        ]
+        r.raise_for_status()
 
-        chat = model.start_chat(history=gemini_history)
-        response = chat.send_message(final_prompt)
+        result = r.json()
 
-        answer = (
-            response.text.strip()
-            if response and getattr(response, "text", None)
-            else "Empty response from Gemini."
-        )
-
-        return answer
+        return result["choices"][0]["message"]["content"].strip()
 
     except Exception as e:
-        return f"Error calling Gemini: {e}"
 
+        return f"Local model error: {e}"
 
 
 # -------------------------------------------------
 # Function to get Veronica's response based on KB
 # -------------------------------------------------
+from global_setup import DATA
+def handle_stream_query(query, data):
+    q = query.lower()
+
+    mappings = data.get("mappings", {})
+    fees = data.get("fees", {})
+
+    results = []
+
+    # ✅ 1. DIRECT STREAM MATCH (FIXES YOUR BUG)
+    for stream in fees:
+        if stream.lower() in q:
+            return f"{stream} – ₹{fees[stream]}"
+
+    # ✅ 2. CATEGORY MATCH (arts, science, commerce)
+    for key, streams in mappings.items():
+        if key in q:
+            for s in streams:
+                if s in fees:
+                    results.append(f"{s} – ₹{fees[s]}")
+            return "\n".join(results)
+
+    return None
 def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: str) -> str:
     # quick utility commands
     if user_question.lower() == 'date':
         answer = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}"
-        # store in history
         save_message(session_id, "user", user_question)
         save_message(session_id, "assistant", answer)
         return answer
@@ -209,6 +231,15 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
         save_message(session_id, "user", user_question)
         save_message(session_id, "assistant", answer)
         return answer
+
+    # 🔥 NEW: Handle stream/fees BEFORE anything else
+    if "fee" in user_question.lower() or "fees" in user_question.lower():
+        stream_answer = handle_stream_query(user_question, DATA)
+        if stream_answer:
+            answer = stream_answer
+            save_message(session_id, "user", user_question)
+            save_message(session_id, "assistant", answer)
+            return answer
 
     # Try FAQ/knowledge base first
     best_match = find_best_match(
@@ -220,14 +251,13 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
         answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
     else:
         # If no match is found in the knowledge base, ask Gemini to generate a response
-        answer = get_gemini_response(user_question, session_id)
+         answer = get_llama_response(user_question, session_id)
 
     # Save this turn in Redis so future messages have context
     save_message(session_id, "user", user_question)
     save_message(session_id, "assistant", answer)
 
     return answer
-
 # Main section for testing purposes
 if __name__ == "__main__":
     knowledge_base = load_knowledge_base('knowledge_base.json')
