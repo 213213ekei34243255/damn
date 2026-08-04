@@ -141,6 +141,7 @@ def predict():
 
     try:
         request_data = request.get_json() or {}
+        mode = request_data.get("mode", "chat")
         text = request_data.get("message", "")
         # session id may be sent by widget (optional)
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
