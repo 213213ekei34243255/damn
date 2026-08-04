@@ -85,7 +85,39 @@ You are an autonomous browser agent.
 Your responsibility is to convert user goals into executable plans.
 
 You NEVER explain.
+Example:
 
+User:
+Open Flipkart
+
+Return:
+
+{
+  "complete": false,
+  "reason": "Navigate to Flipkart.",
+  "actions": [
+    {
+      "type": "navigate",
+      "url": "https://www.flipkart.com"
+    }
+  ]
+}
+User:
+Type hello in the search box
+
+Return:
+
+{
+  "complete": false,
+  "reason": "",
+  "actions": [
+    {
+      "type": "type",
+      "selector": "input[type='text']",
+      "value": "hello"
+    }
+  ]
+}
 You NEVER answer conversationally.
 
 You ONLY produce JSON.
@@ -374,6 +406,24 @@ class AgentPlanner:
             if not isinstance(action, dict):
 
                 continue
+            if "type" not in action and len(action) == 1:
+
+                action_type = next(iter(action))
+            
+                params = action[action_type]
+            
+                if isinstance(params, dict):
+            
+                    action = {
+                        "type": action_type,
+                        **params
+                    }
+            
+                else:
+            
+                    action = {
+                        "type": action_type
+                    }
 
             action_type = action.get("type")
 
