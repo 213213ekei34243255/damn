@@ -148,6 +148,7 @@ def predict():
         print(request_data)
     
         mode = request_data.get("mode", "chat")
+        message = request_data.get("message", "")
     
         print("MODE =", mode)
         print("================================")
@@ -166,6 +167,56 @@ def predict():
                 "answer": "Invalid input"
         
             }), 400
+        if mode == "auto":
+
+            user_message = request_data.get("message", "").lower()
+        
+            browser_keywords = [
+        
+                "open",
+                "go to",
+                "navigate",
+                "visit",
+                "search",
+                "find",
+                "click",
+                "scroll",
+                "type",
+                "press",
+                "download",
+                "upload",
+                "reload",
+                "refresh",
+                "back",
+                "forward",
+                "new tab",
+                "close tab",
+                "switch tab",
+                "login",
+                "log in",
+                "sign in"
+        
+            ]
+        
+            is_agent = any(k in user_message for k in browser_keywords)
+        
+            if is_agent:
+        
+                plan = get_agent_plan(
+        
+                    goal=request_data.get("message", ""),
+        
+                    observation=request_data.get("observation", {}),
+        
+                    memory=request_data.get("memory", {}),
+        
+                    session_id=request_data.get("session_id", "default")
+        
+                )
+        
+                return jsonify(plan)
+        
+            mode = "chat"
         # =====================================================
 # NOAH AGENT MODE
 # =====================================================
