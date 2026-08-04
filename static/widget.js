@@ -413,20 +413,27 @@
           const doFetch = async () => {
           
 
-          const payload = {
-              mode: "auto",
-              message: val,
-              session_id: SESSION_ID,
-              observation: {
-                  url: location.href,
-                  title: document.title,
-                  text: document.body.innerText.substring(0, 4000)
-              },
-              memory: {},
-              user_agent: navigator.userAgent,
-              language: navigator.language,
-              timestamp: new Date().toISOString()
-          };
+         const payload = {
+                mode: "agent",
+            
+                goal: val,
+            
+                session_id: SESSION_ID,
+            
+                observation: {
+                    url: location.href,
+                    title: document.title,
+                    text: document.body.innerText.substring(0, 4000)
+                },
+            
+                memory: {},
+            
+                user_agent: navigator.userAgent,
+            
+                language: navigator.language,
+            
+                timestamp: new Date().toISOString()
+            };
             console.log('[VERONICA] POST', BASE_API + '/predict', 'payload:', payload);
             const res = await fetch(BASE_API + '/predict', {
               method: 'POST',
