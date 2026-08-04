@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_from_directory, make_response, s
 from Veronica import get_veronica_response, load_knowledge_base, save_knowledge_base
 from flask_cors import CORS
 import os
+from agent import get_agent_plan
 import google.generativeai as genai
 import re
 import logging
@@ -11,6 +12,7 @@ import psycopg2
 import psycopg2.extras
 import io
 import csv
+import json
 
 # ---- Configuration ----
 logging.basicConfig(level=logging.DEBUG)
@@ -143,14 +145,81 @@ def predict():
         request_data = request.get_json() or {}
         mode = request_data.get("mode", "chat")
         text = request_data.get("message", "")
+        goal = request_data.get("goal", "")
         # session id may be sent by widget (optional)
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
         url = request_data.get('url')
         
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
 
-        if not text:
-            return jsonify({"answer": "Invalid input"}), 400
+        if mode == "chat" and not text:
+
+            return jsonify({
+        
+                "answer": "Invalid input"
+        
+            }), 400
+        # =====================================================
+# NOAH AGENT MODE
+# =====================================================
+
+        if mode == "agent":
+        
+            goal = request_data.get("goal", "")
+        
+            observation = request_data.get("observation", {})
+        
+            memory = request_data.get("memory", {})
+        
+            if not goal:
+        
+                return jsonify({
+        
+                    "error": "Missing goal."
+        
+                }), 400
+            try:
+
+                db_insert_message(
+                    session_id,
+                    "agent",
+                    goal,
+                    reply_id=None,
+                    url=url,
+                    user_agent=user_agent
+                )
+            
+            except Exception:
+            
+                app.logger.exception("Agent logging failed")
+        
+            plan = get_agent_plan(
+        
+                goal=goal,
+        
+                observation=observation,
+        
+                memory=memory,
+        
+                session_id=session_id
+        
+            )
+            try:
+
+                db_insert_message(
+                    session_id,
+                    "planner",
+                    json.dumps(plan),
+                    reply_id=str(uuid.uuid4())[:12],
+                    url=url,
+                    user_agent=user_agent
+                )
+            
+            except Exception:
+            
+                app.logger.exception("Planner logging failed")
+        
+            return jsonify(plan), 200
 
         user_text = text.strip().lower()
 
