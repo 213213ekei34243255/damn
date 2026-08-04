@@ -411,39 +411,22 @@
           const typingDiv = appendMessage('Just a moment...', 'veronica');
 
           const doFetch = async () => {
-          const isAgentRequest = shouldUseAgent(val);
+          
 
-          let payload;
-          
-          if (isAgentRequest) {
-          
-              payload = {
-                  mode: "agent",
-                  goal: val,
-                  session_id: SESSION_ID,
-          
-                  observation: {
-                      url: location.href,
-                      title: document.title,
-                      text: document.body.innerText.substring(0, 4000)
-                  },
-          
-                  memory: {}
-              };
-          
-          } else {
-          
-              payload = {
-                  mode: "chat",
-                  message: val,
-                  session_id: SESSION_ID,
+          const payload = {
+              mode: "auto",
+              message: val,
+              session_id: SESSION_ID,
+              observation: {
                   url: location.href,
-                  user_agent: navigator.userAgent,
-                  language: navigator.language,
-                  timestamp: new Date().toISOString()
-              };
-          
-          }
+                  title: document.title,
+                  text: document.body.innerText.substring(0, 4000)
+              },
+              memory: {},
+              user_agent: navigator.userAgent,
+              language: navigator.language,
+              timestamp: new Date().toISOString()
+          };
             console.log('[VERONICA] POST', BASE_API + '/predict', 'payload:', payload);
             const res = await fetch(BASE_API + '/predict', {
               method: 'POST',
