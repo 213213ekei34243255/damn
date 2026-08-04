@@ -47,15 +47,15 @@ SUPPORTED_ACTIONS = {
 
     "reload",
 
-    "back",
+    "goBack",
 
-    "forward",
+    "goForward",
 
     "download",
 
     "upload",
 
-    "newTab",
+    "createTab",
 
     "closeTab",
 
@@ -64,6 +64,9 @@ SUPPORTED_ACTIONS = {
     "complete"
 
 }
+ACTION_GO_BACK = "goBack"
+ACTION_GO_FORWARD = "goForward"
+ACTION_CREATE_TAB = "createTab"
 
 
 # ================================
@@ -108,11 +111,11 @@ wait
 observe
 extract
 reload
-back
-forward
+goBack
+goForward
 download
 upload
-newTab
+createTab
 closeTab
 switchTab
 complete
