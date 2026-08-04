@@ -398,6 +398,7 @@
           appendHtmlMessage(`<a class="vai-link" href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`, 'veronica');
         }
       }
+      
 
       async function sendMessage() {
         const val = inputEl.value.trim();
@@ -410,14 +411,39 @@
           const typingDiv = appendMessage('Just a moment...', 'veronica');
 
           const doFetch = async () => {
-            const payload = {
-              message: val,
-              session_id: SESSION_ID,   // <--- this is what your Redis backend uses
-              url: location.href,
-              user_agent: navigator.userAgent || '',
-              language: navigator.language || '',
-              timestamp: (new Date()).toISOString()
-            };
+          const isAgentRequest = shouldUseAgent(val);
+
+          let payload;
+          
+          if (isAgentRequest) {
+          
+              payload = {
+                  mode: "agent",
+                  goal: val,
+                  session_id: SESSION_ID,
+          
+                  observation: {
+                      url: location.href,
+                      title: document.title,
+                      text: document.body.innerText.substring(0, 4000)
+                  },
+          
+                  memory: {}
+              };
+          
+          } else {
+          
+              payload = {
+                  mode: "chat",
+                  message: val,
+                  session_id: SESSION_ID,
+                  url: location.href,
+                  user_agent: navigator.userAgent,
+                  language: navigator.language,
+                  timestamp: new Date().toISOString()
+              };
+          
+          }
             console.log('[VERONICA] POST', BASE_API + '/predict', 'payload:', payload);
             const res = await fetch(BASE_API + '/predict', {
               method: 'POST',
