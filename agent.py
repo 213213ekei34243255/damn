@@ -100,6 +100,19 @@ Every response MUST follow this schema:
 
     ]
 }
+Example of a correct response:
+{
+    "complete": false,
+    "reason": "Navigating to Amazon",
+    "actions": [
+        { "type": "navigate", "url": "https://www.amazon.com" }
+    ]
+}
+
+Example of an INCORRECT response (never do this):
+{
+    "actions": ["navigate", "type"]
+}
 
 Supported action types are:
 
