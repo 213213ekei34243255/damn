@@ -1,3 +1,4 @@
+
 import json
 import os
 import logging
@@ -356,42 +357,32 @@ class AgentPlanner:
     ):
 
         if not isinstance(plan, dict):
-
             raise ValueError("Plan must be an object.")
 
         if "actions" not in plan:
-
             plan["actions"] = []
 
         if "complete" not in plan:
-
             plan["complete"] = False
 
         valid_actions = []
 
         for action in plan["actions"]:
 
-            if not isinstance(action, dict):
+            # NEW: coerce bare strings like "navigate" into {"type": "navigate"}
+            if isinstance(action, str):
+                action = {"type": action}
 
+            if not isinstance(action, dict):
                 continue
 
             action_type = action.get("type")
 
             if action_type not in SUPPORTED_ACTIONS:
-
-                logger.warning(
-
-                    f"Unsupported action: {action_type}"
-
-                )
-
+                logger.warning(f"Unsupported action: {action_type}")
                 continue
 
-            valid_actions.append(
-
-                self.sanitize_action(action)
-
-            )
+            valid_actions.append(self.sanitize_action(action))
 
         plan["actions"] = valid_actions
 
@@ -402,7 +393,6 @@ class AgentPlanner:
     ):
 
         retries = 3
-
         last_error = None
 
         for _ in range(retries):
@@ -410,46 +400,36 @@ class AgentPlanner:
             try:
 
                 text = self.call_llm(messages)
-
                 plan = self.extract_json(text)
-                logger.info(
+                raw_action_count = len(plan.get("actions", []))
 
-                    json.dumps(
+                validated = self.validate(plan)
 
-                        plan,
-
-                        indent=4
-
+                # NEW: if the model gave us actions but validation stripped
+                # all of them (malformed schema), treat this as a failed
+                # attempt and retry rather than silently returning empty.
+                if raw_action_count > 0 and len(validated["actions"]) == 0 and not validated.get("complete"):
+                    logger.warning(
+                        f"Model returned {raw_action_count} action(s) but all failed validation; retrying."
                     )
+                    last_error = ValueError("All actions failed schema validation")
+                    continue
 
-                )
-
-                return self.validate(plan)
+                logger.info(json.dumps(validated, indent=4))
+                return validated
 
             except Exception as e:
-
                 logger.warning(e)
-
                 last_error = e
 
         logger.error(last_error)
 
         return {
-
             "complete": False,
-
             "reason": "Planner failed.",
-
             "actions": [
-
-                {
-
-                    "type": "observe"
-
-                }
-
+                {"type": "observe"}
             ]
-
         }
     def sanitize_action(
             self,
