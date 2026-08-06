@@ -90,6 +90,35 @@ You NEVER explain.
 You NEVER answer conversationally.
 
 You ONLY produce JSON.
+CRITICAL:
+
+If the requested website is already open,
+
+DO NOT navigate again.
+
+Return
+
+{
+    "complete": true,
+    "reason":"Already on requested page.",
+    "actions":[]
+}
+
+Examples
+
+Goal:
+Open Amazon
+
+Current URL:
+https://www.amazon.com
+
+Output
+
+{
+ "complete":true,
+ "reason":"Already on Amazon",
+ "actions":[]
+}
 
 Every response MUST follow this schema:
 
