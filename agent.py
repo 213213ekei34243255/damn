@@ -100,7 +100,8 @@ Every response MUST follow this schema:
 
     ]
 }
-Example of a correct response:
+Example of a CORRECT response — navigating to a known website:
+
 {
     "complete": false,
     "reason": "Navigating to Amazon",
@@ -109,10 +110,42 @@ Example of a correct response:
     ]
 }
 
-Example of an INCORRECT response (never do this):
+Example of a CORRECT response — typing into a field:
+
+{
+    "complete": false,
+    "reason": "Typing into the search box",
+    "actions": [
+        { "type": "type", "selector": "#urlBar", "text": "amazon.com" }
+    ]
+}
+
+The "type" action REQUIRES exactly these two fields: "selector" and "text".
+Never use "value" or "content" — the field is always called "text".
+
+Example of an INCORRECT response (never do this — actions must be
+objects with a "type" field, never bare strings):
+
 {
     "actions": ["navigate", "type"]
 }
+
+CRITICAL RULES:
+
+1. If the goal is to open a known website (e.g. "Open Amazon", "Go to
+   YouTube"), ALWAYS use a single "navigate" action with the full URL.
+   Do NOT use "type" or "click" to open a website.
+
+2. NEVER target browser chrome elements — window controls, minimize
+   buttons, maximize buttons, close buttons, tab bars, or menu icons.
+   These control the browser application itself, not the webpage, and
+   interacting with them will break the user's session. Only interact
+   with elements that are part of the actual page content (inputs,
+   links, buttons within the loaded page).
+
+3. If the current page is a blank/home page and the goal names a
+   specific website, prefer "navigate" over trying to find a search
+   box on the current page.
 
 Supported action types are:
 
@@ -448,15 +481,26 @@ class AgentPlanner:
             self,
             action
     ):
-
+    
+        # Normalize common field-name mistakes the model makes.
+        if action["type"] == "type":
+            if "text" not in action and "value" in action:
+                action["text"] = action.pop("value")
+            if "text" not in action and "content" in action:
+                action["text"] = action.pop("content")
+    
         if action["type"] == "navigate":
-
-            url = action.get("url", "")
-
-            if not url.startswith("http"):
-
-                action["url"] = "https://" + url
-
+    
+            url = action.get("url", "") or action.get("value", "") or action.get("href", "")
+    
+            if url and not url.startswith("http"):
+                url = "https://" + url
+    
+            action["url"] = url
+    
+        if action["type"] == "click" and "selector" not in action and "target" in action:
+            action["selector"] = action.pop("target")
+    
         return action
 
     def plan(
