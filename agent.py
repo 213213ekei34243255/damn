@@ -332,27 +332,47 @@ class AgentPlanner:
             }
     
         ]
-    def summarize_observation(self, observation: Dict):
-        browser = observation.get("browser", {}) or {}
+    def summarize_observation(
+            self,
+            observation: Dict
+    ):
+
+        """
+        Reduce unnecessary HTML before sending
+        to the LLM. buttons/inputs/links/text live under
+        observation["page"], not at the top level.
+        """
+
         page = observation.get("page", {}) or {}
-    
+        browser = observation.get("browser", {}) or {}
+
+        def _slim_button(b):
+            return {"text": (b.get("text") or "")[:80], "selector": b.get("selector", "")}
+
+        def _slim_input(i):
+            return {
+                "type": i.get("type", ""),
+                "placeholder": (i.get("placeholder") or "")[:60],
+                "name": (i.get("name") or "")[:60],
+                "selector": i.get("selector", ""),
+            }
+
+        def _slim_link(l):
+            return {"text": (l.get("text") or "")[:80], "href": l.get("href", ""), "selector": l.get("selector", "")}
+
+        buttons = [b for b in page.get("buttons", []) if b.get("visible") is not False]
+        inputs = page.get("inputs", [])
+        links = [l for l in page.get("links", []) if l.get("visible") is not False]
+
         summary = {
-            "title": browser.get("title"),
+            "title": browser.get("title") or observation.get("title"),
             "url": browser.get("url") or observation.get("url"),
-            "buttons": [
-                {"text": b.get("text"), "selector": b.get("selector")}
-                for b in page.get("buttons", []) if b.get("visible") is not False
-            ][:20],
-            "inputs": [
-                {"type": i.get("type"), "placeholder": i.get("placeholder"), "selector": i.get("selector")}
-                for i in page.get("inputs", [])
-            ][:20],
-            "links": [
-                {"text": l.get("text"), "href": l.get("href"), "selector": l.get("selector")}
-                for l in page.get("links", []) if l.get("visible") is not False
-            ][:20],
-            "text": (page.get("pageText") or page.get("text") or "")[:4000],
+            "buttons": [_slim_button(b) for b in buttons[:20]],
+            "inputs": [_slim_input(i) for i in inputs[:20]],
+            "links": [_slim_link(l) for l in links[:20]],
+            "text": (page.get("text") or observation.get("text") or "")[:4000],
         }
+
         return summary
     def merge_memory(
             self,
