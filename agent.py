@@ -332,32 +332,27 @@ class AgentPlanner:
             }
     
         ]
-    def summarize_observation(
-            self,
-            observation: Dict
-    ):
-    
-        """
-        Reduce unnecessary HTML before sending
-        to the LLM.
-        """
+    def summarize_observation(self, observation: Dict):
+        browser = observation.get("browser", {}) or {}
+        page = observation.get("page", {}) or {}
     
         summary = {
-    
-            "title": observation.get("title"),
-    
-            "url": observation.get("url"),
-    
-            "buttons": observation.get("buttons", [])[:20],
-    
-            "inputs": observation.get("inputs", [])[:20],
-    
-            "links": observation.get("links", [])[:20],
-    
-            "text": observation.get("text", "")[:4000]
-    
+            "title": browser.get("title"),
+            "url": browser.get("url") or observation.get("url"),
+            "buttons": [
+                {"text": b.get("text"), "selector": b.get("selector")}
+                for b in page.get("buttons", []) if b.get("visible") is not False
+            ][:20],
+            "inputs": [
+                {"type": i.get("type"), "placeholder": i.get("placeholder"), "selector": i.get("selector")}
+                for i in page.get("inputs", [])
+            ][:20],
+            "links": [
+                {"text": l.get("text"), "href": l.get("href"), "selector": l.get("selector")}
+                for l in page.get("links", []) if l.get("visible") is not False
+            ][:20],
+            "text": (page.get("pageText") or page.get("text") or "")[:4000],
         }
-
         return summary
     def merge_memory(
             self,
@@ -375,42 +370,15 @@ class AgentPlanner:
 
         return merged
 
-    def call_llm(
-            self,
-            messages: List[Dict]
-    ):
-
-        payload = {
-
-            "model": MODEL_NAME,
-
-            "messages": messages,
-
-            "temperature": 0.15,
-
-            "max_tokens": 1024
-
-        }
-
+    def call_llm(self, messages: List[Dict]):
+        payload = {"model": MODEL_NAME, "messages": messages, "temperature": 0.15, "max_tokens": 1024}
         logger.info("🧠 Sending planning request to Rexy...")
-
-        response = requests.post(
-
-            LLAMA_URL,
-
-            json=payload,
-
-            timeout=120
-
-        )
-
+        response = requests.post(LLAMA_URL, json=payload, timeout=120)
+        if not response.ok:
+            logger.warning(f"LLM request failed [{response.status_code}]: {response.text[:2000]}")
         response.raise_for_status()
-
         result = response.json()
-
-        text = result["choices"][0]["message"]["content"].strip()
-
-        return text
+        return result["choices"][0]["message"]["content"].strip()
     def extract_json(
             self,
             text: str
