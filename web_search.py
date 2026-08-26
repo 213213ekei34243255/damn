@@ -91,6 +91,11 @@ _EXPLICIT_SEARCH_PATTERN = re.compile(
     r'search the internet|browse (the web|online) for|find (me )?(info|information|news) (on|about))\b',
     re.IGNORECASE
 )
+_EXPLICIT_SEARCH_GENERIC_PATTERN = re.compile(
+    r'\b(search|check|look|browse|google)\b[^.?!\n]{0,30}\b(web|internet|online)\b'
+    r'|\b(web|internet|online)\b[^.?!\n]{0,30}\b(search|check|look|browse)\b',
+    re.IGNORECASE
+)
 
 # Words/phrases that hint the user wants fresh, real-world, time-sensitive
 # info - things a static LLM genuinely cannot know (scores, prices, who
