@@ -9,6 +9,9 @@ import re
 
 from openai import OpenAI
 
+# NEW: free, keyless web search (DuckDuckGo) support
+from web_search import build_web_context
+
 # Initialize DeepSeek client
 
 
@@ -111,7 +114,7 @@ import requests
 LLAMA_URL = "http://127.0.0.1:8080/v1/chat/completions"
 
 
-def get_llama_response(user_question: str, session_id: str) -> str:
+def get_llama_response(user_question: str, session_id: str, web_context: str = "") -> str:
 
     # Encode query
     user_emb = model_embed.encode(
@@ -144,7 +147,11 @@ def get_llama_response(user_question: str, session_id: str) -> str:
             "role": "system",
             "content": """
            "You are Noah, Working in Jonah Browser you were made by CogniAI Studios , and your architecture is Rexy 1\n"
-            "Answer all the questions asked by the user check Internet and then answer web related answers have modern american language like bruh and then being too human way"
+            "Answer all the questions asked by the user check Internet and then answer web related answers have modern american language like bruh and then being too human way\n"
+            "When you are given a 'Web Search Results' block below, treat it as freshly retrieved, up-to-date information - use it to answer, "
+            "summarize it in your own words, and mention it naturally (e.g. 'from what I just found online...'). "
+            "If the web results don't actually answer the question, say so instead of making something up. "
+            "Never dump raw links or citation numbers like [1] into your reply - just talk about what you found."
         """
         }
     ]
@@ -153,6 +160,13 @@ def get_llama_response(user_question: str, session_id: str) -> str:
         messages.append({
             "role": "system",
             "content": f"Knowledge Base:\n{context}"
+        })
+
+    # NEW: inject freshly retrieved web search context, if any
+    if web_context:
+        messages.append({
+            "role": "system",
+            "content": f"Web Search Results (live, fetched just now):\n{web_context}"
         })
 
     for m in history:
@@ -250,8 +264,18 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
     if best_match:
         answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
     else:
-        # If no match is found in the knowledge base, ask Gemini to generate a response
-         answer = get_llama_response(user_question, session_id)
+        # ALWAYS search the web before letting the LLM answer, so replies
+        # are grounded in fresh info rather than the model's own memory.
+        # (KB hits above skip this - they're already authoritative and
+        # instant, no need to slow those down.)
+        try:
+            web_context = build_web_context(user_question)
+        except Exception:
+            # Never let a search failure break the chat - just fall back
+            # to answering without web context instead of erroring out.
+            web_context = ""
+
+        answer = get_llama_response(user_question, session_id, web_context=web_context)
 
     # Save this turn in Redis so future messages have context
     save_message(session_id, "user", user_question)
