@@ -19,6 +19,7 @@ import re
 import time
 import logging
 import requests
+from typing import Optional
 from bs4 import BeautifulSoup
 
 try:
@@ -129,6 +130,38 @@ def _cache_set(key: str, value: str) -> None:
         for k, (_, exp) in list(_CACHE.items()):
             if now > exp:
                 _CACHE.pop(k, None)
+
+
+def resolve_site_url(name: str, max_results: int = 3) -> Optional[str]:
+    """
+    Lightweight lookup for "what's the actual URL for X" - no page
+    fetching, just the first plausible link from a search result.
+
+    Used by the browser agent (agent.py) so 'navigate' actions use a
+    real, verified URL instead of the LLM guessing/hallucinating one
+    (e.g. inventing "www.somesite-college.org" for "open <school>").
+
+    Cached for _CACHE_TTL_SECONDS under a "site:" prefix so repeated
+    "open X" goals in the same session don't re-hit the search engine.
+    """
+    cache_key = f"site:{name.strip().lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached or None  # cached "" means "looked it up, found nothing"
+
+    url = None
+    try:
+        results = search_web(f"{name} official website", max_results=max_results)
+        for r in results:
+            candidate = r.get("url", "")
+            if candidate.startswith("http"):
+                url = candidate
+                break
+    except Exception as e:
+        logger.exception("resolve_site_url failed for %r: %s", name, e)
+
+    _cache_set(cache_key, url or "")
+    return url
 
 
 def build_web_context(query: str, max_results: int = 5, fetch_pages: bool = True,
