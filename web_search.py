@@ -65,6 +65,104 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NoahBot/1.0; +https://byncai.net)"
 }
 
+
+# --------------------
+# Search gating: decide whether a question actually needs a live web
+# search, instead of searching on every single non-KB message. Searching
+# for "Hey" or "what's photosynthesis" wastes an API call (and Serper's
+# free tier is capped) for something the LLM already knows fine on its
+# own or that isn't even a real question.
+# --------------------
+
+# Short greetings / chit-chat / acknowledgements - never worth a search,
+# no matter what. Checked first, as a fast bailout.
+_CHITCHAT_PATTERN = re.compile(
+    r'^\s*(hi+|hey+|hello+|yo+|sup+|hola|howdy|good\s*(morning|afternoon|evening|night)|'
+    r'thanks?( you)?|thank\s*you|ty|thx|ok(ay)?|cool|nice|great|awesome|lol+|haha+|'
+    r'bye+|goodbye|see\s*ya|cya|what\'?s\s*up|how\s*are\s*you|how\'?s\s*it\s*going|'
+    r'yes|yeah|yep|no|nope|sure|alright|got\s*it)\s*[!.?]*\s*$',
+    re.IGNORECASE
+)
+
+# Explicit "go look this up for me" requests - the user is directly
+# asking for a search, so always honor it regardless of topic.
+_EXPLICIT_SEARCH_PATTERN = re.compile(
+    r'\b(search (the web |online )?for|look up|check online|google (it|this|that)|'
+    r'search the internet|browse (the web|online) for|find (me )?(info|information|news) (on|about))\b',
+    re.IGNORECASE
+)
+
+# Words/phrases that hint the user wants fresh, real-world, time-sensitive
+# info - things a static LLM genuinely cannot know (scores, prices, who
+# currently holds a role, breaking news, etc.). This is intentionally
+# generous - a false positive just means we search a bit more than
+# strictly necessary, which is harmless. A false negative means a stale
+# answer, which is worse, so lean toward including borderline triggers.
+WEB_SEARCH_TRIGGERS = [
+    "latest", "today", "current", "currently", "news", "update", "updated",
+    "right now", "this week", "this month", "this year", "recent", "recently",
+    "price of", "stock price", "exchange rate", "score", "weather", "forecast",
+    "who is the current", "who won", "who is winning", "release date",
+    "when is", "when was", "when does", "what happened", "happening now",
+    "election", "ceo of", "president of", "prime minister of",
+    "is still", "is it still", "does still exist", "still around",
+    "just announced", "breaking", "live", "schedule for", "upcoming",
+]
+
+# Generic-knowledge / conceptual-question phrasing - things the LLM
+# should just answer from its own training, NOT search for, even though
+# they're "questions." A trigger word above still overrides this (e.g.
+# "explain the latest AI news" should still search).
+_GENERIC_KNOWLEDGE_PATTERN = re.compile(
+    r'^\s*(explain|what is|what are|how does|how do|why does|why do|why is|'
+    r'define|describe|tell me about the theory|what does .* mean|'
+    r'can you explain|help me understand|what\'?s the difference between)\b',
+    re.IGNORECASE
+)
+
+
+def needs_web_search(question: str) -> bool:
+    """
+    Decide whether a question needs a live web search, rather than
+    searching unconditionally on every message.
+
+    Order of checks:
+      1. Chit-chat / greetings -> never search.
+      2. Explicit "search for X" style requests -> always search.
+      3. Time-sensitive/current-event trigger words, or a recent year
+         (2024-2029) -> search.
+      4. Generic "explain/what is/how does" conceptual phrasing with no
+         trigger word -> don't search (the LLM can answer this itself).
+      5. Default: don't search. Most ordinary chat, opinions, small talk,
+         math, general science, or explanations don't need it - only
+         search when there's a real signal the LLM needs fresher info
+         than its training data provides.
+    """
+    q = question.strip().lower()
+
+    if not q:
+        return False
+
+    if _CHITCHAT_PATTERN.match(q):
+        return False
+
+    if _EXPLICIT_SEARCH_PATTERN.search(q):
+        return True
+
+    if any(trigger in q for trigger in WEB_SEARCH_TRIGGERS):
+        return True
+
+    # A "current-ish" year (2024-2029) is a strong signal something is
+    # time-sensitive (an event, a release, a result) even without one of
+    # the trigger phrases above.
+    if re.search(r"\b(202[4-9])\b", q):
+        return True
+
+    if _GENERIC_KNOWLEDGE_PATTERN.match(q):
+        return False
+
+    return False
+
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
