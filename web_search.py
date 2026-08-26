@@ -85,7 +85,13 @@ _CHITCHAT_PATTERN = re.compile(
 )
 
 # Explicit "go look this up for me" requests - the user is directly
-# asking for a search, so always honor it regardless of topic.
+# asking for a search, so always honor it regardless of topic. Two
+# patterns: named phrases like "search for X", and a more general
+# catch-all for any sentence that pairs an action verb (check/search/
+# look/browse/google) with a target noun (web/internet/online) anywhere
+# nearby - covers phrasings like "check the web", "you have to search
+# online", "can you look online for this" that a fixed phrase list would
+# otherwise miss.
 _EXPLICIT_SEARCH_PATTERN = re.compile(
     r'\b(search (the web |online )?for|look up|check online|google (it|this|that)|'
     r'search the internet|browse (the web|online) for|find (me )?(info|information|news) (on|about))\b',
@@ -128,47 +134,46 @@ _GENERIC_KNOWLEDGE_PATTERN = re.compile(
 
 def needs_web_search(question: str) -> bool:
     """
-    Decide whether a question should be answered from the model/context
-    or augmented with live web search.
-    """
+    Decide whether a question needs a live web search, rather than
+    searching unconditionally on every message.
 
+    Order of checks:
+      1. Chit-chat / greetings -> never search.
+      2. Explicit "search for X" style requests -> always search.
+      3. Time-sensitive/current-event trigger words, or a recent year
+         (2024-2029) -> search.
+      4. Generic "explain/what is/how does" conceptual phrasing with no
+         trigger word -> don't search (the LLM can answer this itself).
+      5. Default: don't search. Most ordinary chat, opinions, small talk,
+         math, general science, or explanations don't need it - only
+         search when there's a real signal the LLM needs fresher info
+         than its training data provides.
+    """
     q = question.strip().lower()
 
     if not q:
         return False
 
-    # 1. Never search simple greetings / acknowledgements.
     if _CHITCHAT_PATTERN.match(q):
         return False
 
-    # 2. Explicit request to search.
     if _EXPLICIT_SEARCH_PATTERN.search(q):
         return True
 
-    # 3. Generic "check/search/look online/web" phrasing.
-    if _EXPLICIT_SEARCH_GENERIC_PATTERN.search(q):
-        return True
-
-    # 4. Fresh / time-sensitive information.
     if any(trigger in q for trigger in WEB_SEARCH_TRIGGERS):
         return True
 
-    # 5. Recent/current years.
+    # A "current-ish" year (2024-2029) is a strong signal something is
+    # time-sensitive (an event, a release, a result) even without one of
+    # the trigger phrases above.
     if re.search(r"\b(202[4-9])\b", q):
         return True
 
-    # 6. Generic conceptual questions can normally be answered
-    #    directly by the model.
     if _GENERIC_KNOWLEDGE_PATTERN.match(q):
         return False
 
-    # 7. Other factual questions are candidates for web search.
-    #    This is deliberately conservative: the caller can use
-    #    model/context confidence to decide whether search is needed.
-    if "?" in q:
-        return True
-
     return False
+
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
