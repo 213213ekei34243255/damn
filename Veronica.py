@@ -46,6 +46,7 @@ def get_answer_for_question(question: str, knowledge_base: Dict) -> Optional[str
 
 import os
 import json
+import logging
 import redis
 import torch
 import numpy as np
@@ -55,6 +56,24 @@ from sentence_transformers import util
 from global_setup import model_embed, CHUNKS, CHUNK_EMBS
 
 import google.generativeai as genai
+
+logger = logging.getLogger("Veronica")
+
+# Set VERONICA_DEBUG_PROMPTS=1 in your environment to log the exact
+# messages array sent to the LLM for every turn. Useful for diagnosing
+# cases where the model seems to ignore web search / RAG context - you
+# can see precisely what it was given.
+DEBUG_PROMPTS = os.getenv("VERONICA_DEBUG_PROMPTS", "0") == "1"
+
+# Minimum semantic-search similarity score (0-1) for a knowledge-base
+# chunk to be included in the prompt. Below this, a chunk is almost
+# certainly irrelevant to the question (e.g. college document chunks
+# surfacing for a totally unrelated question like a sports score) and
+# just adds noise that can distract the model from the actual answer -
+# or from fresh web search results sitting right next to it. Tune this
+# if you find relevant chunks getting filtered out, or irrelevant ones
+# still getting through.
+RAG_SCORE_THRESHOLD = float(os.getenv("VERONICA_RAG_SCORE_THRESHOLD", "0.35"))
 
 
 # --------------------
@@ -130,9 +149,18 @@ def get_llama_response(user_question: str, session_id: str, web_context: str = "
         top_k=20
     )[0]
 
+    # NEW: only keep chunks that are actually relevant to this question.
+    # Previously EVERY chunk in the top_k=20 was injected regardless of
+    # how weak the match was, which means an unrelated question (e.g. a
+    # sports score) still pulled in a wall of irrelevant college-document
+    # text under a "Knowledge Base:" header. That's noise at best, and at
+    # worst it competes for the model's attention against the actually
+    # relevant "Web Search Results" block sitting right next to it.
+    relevant_hits = [h for h in hits if h.get("score", 0) >= RAG_SCORE_THRESHOLD]
+
     retrieved_chunks = [
         CHUNKS[h["corpus_id"]]["text"]
-        for h in hits
+        for h in relevant_hits
     ]
 
     context = "\n\n".join(
@@ -151,34 +179,60 @@ def get_llama_response(user_question: str, session_id: str, web_context: str = "
             "When you are given a 'Web Search Results' block below, treat it as freshly retrieved, up-to-date information - use it to answer, "
             "summarize it in your own words, and mention it naturally (e.g. 'from what I just found online...'). "
             "If the web results don't actually answer the question, say so instead of making something up. "
-            "Never dump raw links or citation numbers like [1] into your reply - just talk about what you found."
+            "Never dump raw links or citation numbers like [1] into your reply - just talk about what you found.\n"
+            "IMPORTANT: A 'Web Search Results' block, when present, is ALWAYS more current than anything you "
+            "already know or said earlier in this conversation. Your own training data has a knowledge cutoff and "
+            "can be out of date - if a Web Search Results block conflicts with your training knowledge OR with "
+            "something said earlier in this chat history, the Web Search Results block wins. Never repeat or default "
+            "back to an older answer from earlier in the conversation once fresher Web Search Results are provided.
         """
         }
     ]
 
-    if context:
-        messages.append({
-            "role": "system",
-            "content": f"Knowledge Base:\n{context}"
-        })
-
-    # NEW: inject freshly retrieved web search context, if any
-    if web_context:
-        messages.append({
-            "role": "system",
-            "content": f"Web Search Results (live, fetched just now):\n{web_context}"
-        })
-
+    # History goes before the fresh context blocks below (not after), so
+    # the most current information - the actual answer to THIS question -
+    # sits closest to the user's question at the end of the prompt. Many
+    # models (especially smaller local ones) weight the end of the prompt
+    # most heavily, so burying fresh web results under a pile of older
+    # chat history was letting stale prior answers win out.
     for m in history:
         messages.append({
             "role": m["role"],
             "content": m["text"]
         })
 
+    if context:
+        messages.append({
+            "role": "system",
+            "content": f"Knowledge Base (only use this if it's actually relevant to the question below):\n{context}"
+        })
+
+    # NEW: inject freshly retrieved web search context, if any - placed
+    # last among the system messages, immediately before the user's
+    # question, so it's the freshest thing in the model's "recent memory"
+    # when it generates its answer.
+    if web_context:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Web Search Results (live, fetched just now - this is more "
+                "current than your training data and more current than "
+                "anything said earlier in this conversation):\n"
+                f"{web_context}"
+            )
+        })
+
     messages.append({
         "role": "user",
         "content": user_question
     })
+
+    if DEBUG_PROMPTS:
+        logger.info(
+            "Final prompt for session=%s question=%r:\n%s",
+            session_id, user_question,
+            json.dumps(messages, indent=2, ensure_ascii=False)
+        )
 
     payload = {
         "model": "local",
