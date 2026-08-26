@@ -4,19 +4,35 @@ web_search.py
 Multi-provider web-search augmentation for the Veronica / Noah chatbot.
 
 Provider order (first success wins):
-    1. Brave Search API   - paid/free-tier key, most reliable, best rate limits
-    2. SearXNG             - free, self-hosted (or public instance) metasearch
-    3. DuckDuckGo (ddgs)   - free, keyless, last-resort fallback
+    1. SerpApi              - official API wrapping real Google results,
+                              authenticated (not scraped), so it isn't
+                              subject to the CAPTCHA/IP-block problems
+                              that hit scraper-based providers on cloud
+                              hosts like Render.
+    2. Brave Search API     - paid/free-tier key, kept as a second option
+                              in case you get that account working later.
+    3. SearXNG              - free, self-hosted (or public instance)
+                              metasearch. Its scraped engines (Google,
+                              Bing, DuckDuckGo, Brave, Startpage) tend to
+                              get CAPTCHA'd from Render's IP ranges, so
+                              in practice this mostly serves Wikipedia
+                              results unless you're self-hosting SearXNG
+                              somewhere with a cleaner IP.
+    4. DuckDuckGo (ddgs)    - free, keyless, last-resort fallback (also
+                              scraped, so also IP-block-prone).
 
-Every provider is wrapped so a failure (timeout, bad key, rate limit, empty
-result, exception of any kind) just falls through to the next one. If all
-three fail, search_web() returns [] and callers already treat that as
-"no web context available".
+Every provider is wrapped so a failure (timeout, bad key, rate limit,
+CAPTCHA, empty result, exception of any kind) just falls through to the
+next one. If all four fail, search_web() returns [] and callers already
+treat that as "no web context available".
 
 Install:
     pip install ddgs beautifulsoup4 requests
 
 Environment variables:
+    SERPAPI_API_KEY - your SerpApi key (get one at https://serpapi.com -
+                       free tier includes 100 searches/month, no credit
+                       card required to sign up)
     BRAVE_API_KEY   - your Brave Search API subscription token
                        (get one at https://brave.com/search/api/)
     SEARXNG_URL     - base URL of a SearXNG instance, e.g.
@@ -24,9 +40,10 @@ Environment variables:
                        instance. If unset, SearXNG is skipped.
     SEARXNG_API_KEY - optional, only needed if your instance requires auth
 
-If BRAVE_API_KEY / SEARXNG_URL are not set, those providers are silently
-skipped and the chain just moves on - nothing breaks, it just falls back
-further down the list (eventually to DuckDuckGo, which needs no config).
+If any of these are not set, that provider is silently skipped and the
+chain just moves on - nothing breaks, it just falls back further down
+the list. DuckDuckGo needs no config, so the chain always has a working
+fallback even with zero env vars set.
 """
 
 import os
@@ -51,8 +68,65 @@ HEADERS = {
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+SERPAPI_ENDPOINT = "https://serpapi.com/search"
+
 SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
 SEARXNG_API_KEY = os.getenv("SEARXNG_API_KEY", "")
+
+
+# --------------------
+# Provider: SerpApi (wraps real Google results via an official API -
+# authenticated request, not a scrape, so it isn't subject to the
+# CAPTCHA/IP-block issues that hit SearXNG's scraped engines)
+# --------------------
+def _search_serpapi(query: str, max_results: int) -> List[Dict]:
+    if not SERPAPI_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            SERPAPI_ENDPOINT,
+            params={
+                "engine": "google",
+                "q": query,
+                "api_key": SERPAPI_API_KEY,
+                "num": max_results,
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for item in data.get("organic_results", [])[:max_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            })
+        # SerpApi also returns a rich "answer_box" for direct-answer
+        # queries (e.g. "who is the CEO of X") - surface it as a
+        # synthetic top result when present, since it's often the single
+        # most useful piece of context for exactly the kind of question
+        # that triggers a web search in the first place.
+        answer_box = data.get("answer_box")
+        if answer_box:
+            snippet = (
+                answer_box.get("snippet")
+                or answer_box.get("answer")
+                or answer_box.get("result")
+                or ""
+            )
+            results.insert(0, {
+                "title": answer_box.get("title", "Answer"),
+                "url": answer_box.get("link", ""),
+                "snippet": snippet,
+            })
+        if results:
+            logger.info("SerpApi search succeeded for query=%r (%d results)", query, len(results))
+        return results
+    except Exception as e:
+        logger.warning("SerpApi search failed for query=%r: %s", query, e)
+        return []
 
 
 # --------------------
@@ -142,8 +216,12 @@ def _search_duckduckgo(query: str, max_results: int) -> List[Dict]:
     return results
 
 
-# Order matters: Brave first (most reliable), then SearXNG, then DDG last.
+# Order matters: SerpApi first (official API, most reliable — not a
+# scraper, so no CAPTCHA/IP-block risk), then Brave (in case you get
+# that key working later), then SearXNG, then DuckDuckGo last as the
+# final, keyless safety net.
 _PROVIDERS = [
+    ("serpapi", _search_serpapi),
     ("brave", _search_brave),
     ("searxng", _search_searxng),
     ("duckduckgo", _search_duckduckgo),
@@ -252,9 +330,9 @@ def resolve_site_url(name: str, max_results: int = 3) -> Optional[str]:
 def build_web_context(query: str, max_results: int = 5, fetch_pages: bool = True,
                        max_pages_to_fetch: int = 3) -> str:
     """
-    Search the web (Brave -> SearXNG -> DuckDuckGo) and assemble one
-    context block, formatted so it's easy for the LLM to reference
-    naturally:
+    Search the web (SerpApi -> Brave -> SearXNG -> DuckDuckGo) and
+    assemble one context block, formatted so it's easy for the LLM to
+    reference naturally:
 
         [1] Title — url
         snippet or fetched page text
