@@ -414,8 +414,10 @@
           
 
          const payload = {
-                mode: "agent",
+                mode: "auto",
             
+                message: val,
+
                 goal: val,
             
                 session_id: SESSION_ID,
@@ -469,6 +471,20 @@
             return;
           }
 
+          // Agent-mode response shape: { complete, reason, actions: [...] }
+          // (no "answer" field). Show the reason as the message, and open
+          // the URL if the plan includes a navigate action.
+          if (Array.isArray(data.actions)) {
+            const navAction = data.actions.find(a => a && a.type === 'navigate' && a.url);
+            const replyText = data.reason || (navAction ? `Opening: ${navAction.url}` : 'On it...');
+            appendMessage(replyText, 'veronica');
+            if (navAction) {
+              openUrlInNewTab(navAction.url);
+            }
+            setStatus('');
+            return;
+          }
+
           if (data.url) {
             appendMessage(data.answer || (`Opening: ${data.url}`), 'veronica');
             openUrlInNewTab(data.url);
@@ -511,20 +527,3 @@
     }
   });
 })();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
