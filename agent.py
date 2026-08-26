@@ -1,9 +1,13 @@
-
 import json
 import os
+import re
 import logging
 import requests
 from typing import Dict, List, Any, Optional
+
+# NEW: free, keyless web search (DuckDuckGo) support - used to resolve the
+# real URL for "open X" / "go to X" goals instead of letting the LLM guess.
+from web_search import resolve_site_url
 
 # ================================
 # Configuration
@@ -68,6 +72,46 @@ SUPPORTED_ACTIONS = {
 ACTION_GO_BACK = "goBack"
 ACTION_GO_FORWARD = "goForward"
 ACTION_CREATE_TAB = "createTab"
+
+
+# ================================
+# Navigation target detection
+# ================================
+
+# Matches goals like "open amazon", "go to youtube", "navigate to the
+# christ junior college website", "visit cogniai studios site".
+# Captures the site NAME so we can look up its real URL via web search
+# instead of letting the LLM guess/hallucinate a domain.
+_NAV_PATTERN = re.compile(
+    r'^\s*(?:open|go to|goto|navigate to|visit)\s+(?:the\s+)?(.+?)\s*(?:website|site|page|homepage)?\s*$',
+    re.IGNORECASE
+)
+
+
+def extract_navigation_target(goal: str) -> Optional[str]:
+    """
+    If the goal is a simple "open/go to/visit X" request, return the
+    site name X. Returns None for anything else (multi-step goals,
+    goals that already contain a URL, clicking/typing instructions,
+    etc.) - those are left to the model as before.
+    """
+    if not goal:
+        return None
+
+    match = _NAV_PATTERN.match(goal.strip())
+    if not match:
+        return None
+
+    target = match.group(1).strip()
+
+    if not target:
+        return None
+
+    # Already a URL - nothing to resolve, let sanitize_action handle it.
+    if target.lower().startswith(("http://", "https://", "www.")):
+        return None
+
+    return target
 
 
 # ================================
@@ -165,6 +209,11 @@ CRITICAL RULES:
    YouTube"), ALWAYS use a single "navigate" action with the full URL.
    Do NOT use "type" or "click" to open a website.
 
+1b. If a "VERIFIED WEBSITE URL" is provided below in the mission, that
+    URL has already been confirmed via live web search — it is the
+    correct destination. Use it exactly as given in your "navigate"
+    action. Do NOT substitute a different URL you think might be right.
+
 2. NEVER target browser chrome elements — window controls, minimize
    buttons, maximize buttons, close buttons, tab bars, or menu icons.
    These control the browser application itself, not the webpage, and
@@ -235,7 +284,8 @@ class AgentPlanner:
             self,
             goal: str,
             observation: Dict,
-            memory: Dict
+            memory: Dict,
+            resolved_url: Optional[str] = None
     ):
     
         """
@@ -253,6 +303,22 @@ class AgentPlanner:
             indent=2,
             ensure_ascii=False
         )
+
+        # NEW: if we resolved a real URL via web search for this goal,
+        # tell the model exactly what to use instead of letting it guess.
+        resolved_block = ""
+        if resolved_url:
+            resolved_block = f"""
+    =========================
+    VERIFIED WEBSITE URL
+    =========================
+
+    Live web search confirms the correct destination for this goal is:
+
+    {resolved_url}
+
+    Use this exact URL in your "navigate" action. Do not invent or modify it.
+    """
     
         user_prompt = f"""
     =========================
@@ -262,7 +328,7 @@ class AgentPlanner:
     Your goal:
     
     {goal}
-    
+    {resolved_block}
     
     =========================
     CURRENT BROWSER STATE
@@ -520,6 +586,32 @@ class AgentPlanner:
     
         return action
 
+    def apply_resolved_navigation(
+            self,
+            plan: Dict,
+            resolved_url: Optional[str]
+    ) -> Dict:
+        """
+        NEW: if we resolved a verified URL via web search for this goal,
+        force every 'navigate' action in the plan to use it. This doesn't
+        rely on the LLM obeying the prompt instruction - it's a hard
+        guarantee that the agent never navigates to a hallucinated domain
+        when we already know the real one.
+        """
+        if not resolved_url:
+            return plan
+
+        for action in plan.get("actions", []):
+            if action.get("type") == "navigate":
+                if action.get("url") != resolved_url:
+                    logger.info(
+                        f"Overriding navigate URL with web-search-verified URL: "
+                        f"{action.get('url')!r} -> {resolved_url!r}"
+                    )
+                action["url"] = resolved_url
+
+        return plan
+
     def plan(
             self,
             goal: str,
@@ -546,15 +638,34 @@ class AgentPlanner:
             merged_memory
         )
 
+        # NEW: if this looks like "open X" / "go to X", resolve the real
+        # URL via web search before we even ask the LLM to plan.
+        resolved_url = None
+        nav_target = extract_navigation_target(goal)
+        if nav_target:
+            try:
+                resolved_url = resolve_site_url(nav_target)
+                if resolved_url:
+                    logger.info(f"Resolved '{nav_target}' -> {resolved_url}")
+                else:
+                    logger.info(f"Could not resolve a URL for '{nav_target}' via web search.")
+            except Exception as e:
+                logger.warning(f"resolve_site_url failed for {nav_target!r}: {e}")
+                resolved_url = None
+
         # Build LLM prompt
         messages = self.build_prompt(
             goal,
             observation,
-            merged_memory
+            merged_memory,
+            resolved_url=resolved_url
         )
 
         # Ask the model
         plan = self.generate_plan(messages)
+
+        # Guarantee the navigate action uses the verified URL, if we have one
+        plan = self.apply_resolved_navigation(plan, resolved_url)
 
         logger.info("Planning complete.")
 
