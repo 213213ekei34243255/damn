@@ -4,7 +4,7 @@ web_search.py
 Multi-provider web-search augmentation for the Veronica / Noah chatbot.
 
 Provider order (first success wins):
-    1. SerpApi              - official API wrapping real Google results,
+    1. Serper.dev            - official API wrapping real Google results,
                               authenticated (not scraped), so it isn't
                               subject to the CAPTCHA/IP-block problems
                               that hit scraper-based providers on cloud
@@ -30,9 +30,9 @@ Install:
     pip install ddgs beautifulsoup4 requests
 
 Environment variables:
-    SERPAPI_API_KEY - your SerpApi key (get one at https://serpapi.com -
-                       free tier includes 100 searches/month, no credit
-                       card required to sign up)
+    SERPER_API_KEY  - your serper.dev API key (get one at
+                       https://serper.dev - free tier includes 2,500
+                       searches/month, no credit card required)
     BRAVE_API_KEY   - your Brave Search API subscription token
                        (get one at https://brave.com/search/api/)
     SEARXNG_URL     - base URL of a SearXNG instance, e.g.
@@ -68,64 +68,57 @@ HEADERS = {
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
-SERPAPI_ENDPOINT = "https://serpapi.com/search"
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
+SERPER_ENDPOINT = "https://google.serper.dev/search"
 
 SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
 SEARXNG_API_KEY = os.getenv("SEARXNG_API_KEY", "")
 
 
 # --------------------
-# Provider: SerpApi (wraps real Google results via an official API -
+# Provider: Serper.dev (wraps real Google results via an official API -
 # authenticated request, not a scrape, so it isn't subject to the
 # CAPTCHA/IP-block issues that hit SearXNG's scraped engines)
 # --------------------
-def _search_serpapi(query: str, max_results: int) -> List[Dict]:
-    if not SERPAPI_API_KEY:
+def _search_serper(query: str, max_results: int) -> List[Dict]:
+    if not SERPER_API_KEY:
         return []
     try:
-        resp = requests.get(
-            SERPAPI_ENDPOINT,
-            params={
-                "engine": "google",
-                "q": query,
-                "api_key": SERPAPI_API_KEY,
-                "num": max_results,
+        resp = requests.post(
+            SERPER_ENDPOINT,
+            headers={
+                "X-API-KEY": SERPER_API_KEY,
+                "Content-Type": "application/json",
             },
+            json={"q": query, "num": max_results},
             timeout=8,
         )
         resp.raise_for_status()
         data = resp.json()
         results = []
-        for item in data.get("organic_results", [])[:max_results]:
+        for item in data.get("organic", [])[:max_results]:
             results.append({
                 "title": item.get("title", ""),
                 "url": item.get("link", ""),
                 "snippet": item.get("snippet", ""),
             })
-        # SerpApi also returns a rich "answer_box" for direct-answer
-        # queries (e.g. "who is the CEO of X") - surface it as a
-        # synthetic top result when present, since it's often the single
-        # most useful piece of context for exactly the kind of question
-        # that triggers a web search in the first place.
-        answer_box = data.get("answer_box")
+        # Serper also returns a rich "answerBox" for direct-answer queries
+        # (e.g. "who is the CEO of X") - surface it as a synthetic top
+        # result when present, since it's often the single most useful
+        # piece of context for exactly the kind of question that triggers
+        # a web search in the first place.
+        answer_box = data.get("answerBox")
         if answer_box:
-            snippet = (
-                answer_box.get("snippet")
-                or answer_box.get("answer")
-                or answer_box.get("result")
-                or ""
-            )
             results.insert(0, {
                 "title": answer_box.get("title", "Answer"),
                 "url": answer_box.get("link", ""),
-                "snippet": snippet,
+                "snippet": answer_box.get("snippet") or answer_box.get("answer", ""),
             })
         if results:
-            logger.info("SerpApi search succeeded for query=%r (%d results)", query, len(results))
+            logger.info("Serper search succeeded for query=%r (%d results)", query, len(results))
         return results
     except Exception as e:
-        logger.warning("SerpApi search failed for query=%r: %s", query, e)
+        logger.warning("Serper search failed for query=%r: %s", query, e)
         return []
 
 
@@ -216,12 +209,12 @@ def _search_duckduckgo(query: str, max_results: int) -> List[Dict]:
     return results
 
 
-# Order matters: SerpApi first (official API, most reliable — not a
+# Order matters: Serper first (official API, most reliable — not a
 # scraper, so no CAPTCHA/IP-block risk), then Brave (in case you get
 # that key working later), then SearXNG, then DuckDuckGo last as the
 # final, keyless safety net.
 _PROVIDERS = [
-    ("serpapi", _search_serpapi),
+    ("serper", _search_serper),
     ("brave", _search_brave),
     ("searxng", _search_searxng),
     ("duckduckgo", _search_duckduckgo),
@@ -330,9 +323,9 @@ def resolve_site_url(name: str, max_results: int = 3) -> Optional[str]:
 def build_web_context(query: str, max_results: int = 5, fetch_pages: bool = True,
                        max_pages_to_fetch: int = 3) -> str:
     """
-    Search the web (SerpApi -> Brave -> SearXNG -> DuckDuckGo) and
-    assemble one context block, formatted so it's easy for the LLM to
-    reference naturally:
+    Search the web (Serper -> Brave -> SearXNG -> DuckDuckGo) and assemble
+    one context block, formatted so it's easy for the LLM to reference
+    naturally:
 
         [1] Title — url
         snippet or fetched page text
