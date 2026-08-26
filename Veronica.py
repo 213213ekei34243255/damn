@@ -10,7 +10,7 @@ import re
 from openai import OpenAI
 
 # NEW: free, keyless web search (DuckDuckGo) support
-from web_search import build_web_context
+from web_search import build_web_context, needs_web_search
 
 # Initialize DeepSeek client
 
@@ -318,16 +318,23 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
     if best_match:
         answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
     else:
-        # ALWAYS search the web before letting the LLM answer, so replies
-        # are grounded in fresh info rather than the model's own memory.
-        # (KB hits above skip this - they're already authoritative and
-        # instant, no need to slow those down.)
-        try:
-            web_context = build_web_context(user_question)
-        except Exception:
-            # Never let a search failure break the chat - just fall back
-            # to answering without web context instead of erroring out.
-            web_context = ""
+        # NEW: only search the web when the question actually looks like
+        # it needs fresh/current info (see needs_web_search in
+        # web_search.py) - not for every message. Chit-chat ("Hey"),
+        # general knowledge, science, theories, and explanations the LLM
+        # already knows go straight to the model without burning a
+        # search call. Only things like current events, prices, scores,
+        # "who currently holds X", or an explicit "search for..." request
+        # trigger a real web search.
+        web_context = ""
+        if needs_web_search(user_question):
+            try:
+                web_context = build_web_context(user_question)
+            except Exception:
+                # Never let a search failure break the chat - just fall
+                # back to answering without web context instead of
+                # erroring out.
+                web_context = ""
 
         answer = get_llama_response(user_question, session_id, web_context=web_context)
 
