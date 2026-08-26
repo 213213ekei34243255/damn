@@ -1,25 +1,40 @@
 """
 web_search.py
 --------------
-Lightweight, keyless web-search augmentation for the Veronica / Noah chatbot.
+Multi-provider web-search augmentation for the Veronica / Noah chatbot.
 
-Uses DuckDuckGo (via the `ddgs` package, formerly `duckduckgo_search`) for
-free web search - no API key required. Optionally fetches the top result
-pages for richer context (snippets alone are often too thin), then formats
-everything into a single prompt-ready block that gets handed to the LLM.
+Provider order (first success wins):
+    1. Brave Search API   - paid/free-tier key, most reliable, best rate limits
+    2. SearXNG             - free, self-hosted (or public instance) metasearch
+    3. DuckDuckGo (ddgs)   - free, keyless, last-resort fallback
+
+Every provider is wrapped so a failure (timeout, bad key, rate limit, empty
+result, exception of any kind) just falls through to the next one. If all
+three fail, search_web() returns [] and callers already treat that as
+"no web context available".
 
 Install:
-    pip install ddgs beautifulsoup4
+    pip install ddgs beautifulsoup4 requests
 
-(If you already have the older `duckduckgo_search` package installed,
-this module will fall back to importing from that instead.)
+Environment variables:
+    BRAVE_API_KEY   - your Brave Search API subscription token
+                       (get one at https://brave.com/search/api/)
+    SEARXNG_URL     - base URL of a SearXNG instance, e.g.
+                       "https://searx.example.com" or your self-hosted
+                       instance. If unset, SearXNG is skipped.
+    SEARXNG_API_KEY - optional, only needed if your instance requires auth
+
+If BRAVE_API_KEY / SEARXNG_URL are not set, those providers are silently
+skipped and the chain just moves on - nothing breaks, it just falls back
+further down the list (eventually to DuckDuckGo, which needs no config).
 """
 
+import os
 import re
 import time
 import logging
 import requests
-from typing import Optional
+from typing import Optional, List, Dict
 from bs4 import BeautifulSoup
 
 try:
@@ -33,37 +48,84 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NoahBot/1.0; +https://byncai.net)"
 }
 
-# Words/phrases that hint the user wants fresh, real-world info.
-# This runs BEFORE we decide whether to hit the web, so it's fine for it
-# to be a little generous - a false positive just means we search a bit
-# more often than strictly necessary, which is harmless.
-WEB_SEARCH_TRIGGERS = [
-    "latest", "today", "current", "currently", "news", "update", "updated",
-    "right now", "this week", "this month", "this year", "recent", "recently",
-    "price of", "stock", "score", "weather", "who is the", "who won",
-    "release date", "when is", "when was", "what happened", "happening now",
-    "election", "ceo of", "president of",
-]
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
+SEARXNG_API_KEY = os.getenv("SEARXNG_API_KEY", "")
 
 
-def needs_web_search(question: str) -> bool:
-    """Cheap heuristic: does this question likely need live web info?"""
-    q = question.lower()
-    if any(trigger in q for trigger in WEB_SEARCH_TRIGGERS):
-        return True
-    # A "current-ish" year (2024-2029) is a strong signal too.
-    if re.search(r"\b(202[4-9])\b", q):
-        return True
-    return False
+# --------------------
+# Provider: Brave Search API
+# --------------------
+def _search_brave(query: str, max_results: int) -> List[Dict]:
+    if not BRAVE_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            BRAVE_ENDPOINT,
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": BRAVE_API_KEY,
+            },
+            params={"q": query, "count": max_results},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for item in data.get("web", {}).get("results", [])[:max_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("description", ""),
+            })
+        if results:
+            logger.info("Brave search succeeded for query=%r (%d results)", query, len(results))
+        return results
+    except Exception as e:
+        logger.warning("Brave search failed for query=%r: %s", query, e)
+        return []
 
 
-def search_web(query: str, max_results: int = 5):
-    """
-    Run a DuckDuckGo text search.
-    Returns a list of {title, url, snippet} dicts, or [] on failure -
-    callers should treat an empty list as "no web context available"
-    and just let the LLM answer from its own knowledge / RAG chunks.
-    """
+# --------------------
+# Provider: SearXNG
+# --------------------
+def _search_searxng(query: str, max_results: int) -> List[Dict]:
+    if not SEARXNG_URL:
+        return []
+    try:
+        headers = dict(HEADERS)
+        if SEARXNG_API_KEY:
+            headers["Authorization"] = f"Bearer {SEARXNG_API_KEY}"
+
+        resp = requests.get(
+            f"{SEARXNG_URL}/search",
+            headers=headers,
+            params={"q": query, "format": "json"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for item in data.get("results", [])[:max_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", ""),
+            })
+        if results:
+            logger.info("SearXNG search succeeded for query=%r (%d results)", query, len(results))
+        return results
+    except Exception as e:
+        logger.warning("SearXNG search failed for query=%r: %s", query, e)
+        return []
+
+
+# --------------------
+# Provider: DuckDuckGo (fallback, keyless)
+# --------------------
+def _search_duckduckgo(query: str, max_results: int) -> List[Dict]:
     results = []
     try:
         with DDGS() as ddgs:
@@ -73,9 +135,34 @@ def search_web(query: str, max_results: int = 5):
                     "url": r.get("href") or r.get("url", ""),
                     "snippet": r.get("body", ""),
                 })
+        if results:
+            logger.info("DuckDuckGo search succeeded for query=%r (%d results)", query, len(results))
     except Exception as e:
-        logger.exception("web search failed for query=%r: %s", query, e)
+        logger.warning("DuckDuckGo search failed for query=%r: %s", query, e)
     return results
+
+
+# Order matters: Brave first (most reliable), then SearXNG, then DDG last.
+_PROVIDERS = [
+    ("brave", _search_brave),
+    ("searxng", _search_searxng),
+    ("duckduckgo", _search_duckduckgo),
+]
+
+
+def search_web(query: str, max_results: int = 5) -> List[Dict]:
+    """
+    Try each configured provider in order, returning the first one that
+    yields results. Returns [] only if every provider fails/returns
+    nothing - callers should treat that as "no web context available".
+    """
+    for name, fn in _PROVIDERS:
+        results = fn(query, max_results)
+        if results:
+            return results
+        logger.info("Provider %r returned nothing for query=%r, trying next.", name, query)
+    logger.warning("All search providers failed for query=%r", query)
+    return []
 
 
 def fetch_page_text(url: str, max_chars: int = 1500) -> str:
@@ -99,14 +186,13 @@ def fetch_page_text(url: str, max_chars: int = 1500) -> str:
         return ""
 
 
-
 # --------------------
 # Tiny TTL cache
 # --------------------
-# Since this now runs on essentially every non-KB message, an identical
-# or near-identical question arriving again within a short window (a user
+# Runs on essentially every non-KB message, so an identical or
+# near-identical question arriving again within a short window (a user
 # repeating themselves, a page refresh, two people asking the same thing)
-# shouldn't re-hit DuckDuckGo. Keeps things fast and avoids rate limits.
+# shouldn't re-hit any provider. Keeps things fast and avoids rate limits.
 _CACHE: dict = {}
 _CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
 
@@ -138,11 +224,10 @@ def resolve_site_url(name: str, max_results: int = 3) -> Optional[str]:
     fetching, just the first plausible link from a search result.
 
     Used by the browser agent (agent.py) so 'navigate' actions use a
-    real, verified URL instead of the LLM guessing/hallucinating one
-    (e.g. inventing "www.somesite-college.org" for "open <school>").
+    real, verified URL instead of the LLM guessing/hallucinating one.
 
-    Cached for _CACHE_TTL_SECONDS under a "site:" prefix so repeated
-    "open X" goals in the same session don't re-hit the search engine.
+    Cached under a "site:" prefix so repeated "open X" goals in the
+    same session don't re-hit any search provider.
     """
     cache_key = f"site:{name.strip().lower()}"
     cached = _cache_get(cache_key)
@@ -167,8 +252,9 @@ def resolve_site_url(name: str, max_results: int = 3) -> Optional[str]:
 def build_web_context(query: str, max_results: int = 5, fetch_pages: bool = True,
                        max_pages_to_fetch: int = 3) -> str:
     """
-    Search the web and assemble one context block, formatted so it's easy
-    for the LLM to reference naturally:
+    Search the web (Brave -> SearXNG -> DuckDuckGo) and assemble one
+    context block, formatted so it's easy for the LLM to reference
+    naturally:
 
         [1] Title — url
         snippet or fetched page text
@@ -176,8 +262,8 @@ def build_web_context(query: str, max_results: int = 5, fetch_pages: bool = True
         [2] Title — url
         ...
 
-    Returns "" if the search failed or returned nothing, so the caller
-    can gracefully skip adding web context to the prompt.
+    Returns "" if every provider failed or returned nothing, so the
+    caller can gracefully skip adding web context to the prompt.
     """
     cache_key = query.strip().lower()
     cached = _cache_get(cache_key)
