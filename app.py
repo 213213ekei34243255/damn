@@ -158,6 +158,7 @@ def predict():
         # session id may be sent by widget (optional)
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
         url = request_data.get('url')
+        page_content = request_data.get('page_content', '')
         
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
 
@@ -362,8 +363,17 @@ def predict():
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
         # --- AI RESPONSE (session-aware with Redis + Gemini) ---
+        if page_content:
+            augmented_question = (
+                f"Here is the extracted text of the current web page:\n"
+                f"---\n{page_content}\n---\n\n"
+                f"User request: {text}"
+            )
+        else:
+            augmented_question = text
+
         response = get_veronica_response(
-            user_question=text,
+            user_question=augmented_question,
             knowledge_base=knowledge_base,
             session_id=session_id
         )
