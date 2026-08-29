@@ -23,9 +23,56 @@ MODEL_NAME = os.getenv(
     "local"
 )
 
+# ---------------------------------------------------------------------
+# FIX: the local LLM call used a single 120s timeout with a 3x retry loop
+# around it (up to 360s before ever giving up), and no automatic fallback
+# if that local server was unreachable or too slow to respond in time —
+# which is exactly what "Read timed out (read timeout=120)" in the logs
+# was. Two independent knobs now control this:
+#
+#   LLAMA_CONNECT_TIMEOUT_S - how long to wait for the TCP connection to
+#     even establish. If nothing is listening on LLAMA_URL at all, this
+#     fails in a few seconds instead of hanging for two minutes.
+#
+#   LLAMA_READ_TIMEOUT_S - how long to wait for a response once connected.
+#     Kept generous by default since a CPU-bound local model can be slow,
+#     but far below the old 120s so a single stuck request can't eat
+#     minutes on its own.
+#
+# If the local model doesn't answer within these limits, call_llm()
+# automatically falls back to Gemini (when GEMINI_API_KEY is configured)
+# instead of failing the whole planning cycle.
+# ---------------------------------------------------------------------
+LLAMA_CONNECT_TIMEOUT_S = float(os.getenv("LLAMA_CONNECT_TIMEOUT_S", "5"))
+LLAMA_READ_TIMEOUT_S = float(os.getenv("LLAMA_READ_TIMEOUT_S", "45"))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+_gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        _gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    except Exception:
+        logging.getLogger("NoahAgent").exception(
+            "Gemini fallback configured but failed to initialize; "
+            "falling back to local-only mode."
+        )
+        _gemini_model = None
+
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger("NoahAgent")
+
+if not GEMINI_API_KEY:
+    logger.warning(
+        "GEMINI_API_KEY not set - no fallback available if the local "
+        "LLM at %s is slow or unreachable. Planning requests will fail "
+        "fast instead of hanging, but won't have a second option.",
+        LLAMA_URL,
+    )
 
 
 # ================================
@@ -287,19 +334,26 @@ class AgentPlanner:
             memory: Dict,
             resolved_url: Optional[str] = None
     ):
-    
+
         """
         Build the reasoning prompt for Noah.
         """
-    
+
         observation_json = json.dumps(
             self.summarize_observation(observation),
             indent=2,
             ensure_ascii=False
         )
-    
+
+        # FIX: this used to be `json.dumps(memory, ...)` with NO trimming
+        # at all — the full raw memory blob (cookies, full page snapshot,
+        # unbounded recentActions, etc.) got serialized straight into the
+        # prompt text sent to the LLM on every single planning cycle. That
+        # inflates the input size the model has to process, which costs
+        # real time on a CPU-bound local model. summarize_memory() keeps
+        # only what's actually useful for deciding the next action.
         memory_json = json.dumps(
-            memory,
+            self.summarize_memory(memory),
             indent=2,
             ensure_ascii=False
         )
@@ -319,85 +373,86 @@ class AgentPlanner:
 
     Use this exact URL in your "navigate" action. Do not invent or modify it.
     """
-    
+
         user_prompt = f"""
     =========================
     MISSION
     =========================
-    
+
     Your goal:
-    
+
     {goal}
     {resolved_block}
-    
+
     =========================
     CURRENT BROWSER STATE
     =========================
-    
+
     {observation_json}
-    
-    
+
+
     =========================
     MEMORY
     =========================
-    
+
     {memory_json}
-    
-    
+
+
     =========================
     INSTRUCTIONS
     =========================
-    
+
     Think like an autonomous AI agent.
-    
+
     Observe the browser.
-    
+
     Reason about the next step.
-    
+
     If the goal has already been completed,
     return:
-    
+
     {{
         "complete": true,
         "reason": "...",
         "actions":[]
     }}
-    
+
     Otherwise return ONLY the next actions.
-    
+
     Never return explanations.
-    
+
     Never return markdown.
-    
+
     Never return code.
-    
+
     Only valid JSON.
-    
+
     Keep plans short.
-    
+
     Do NOT generate more than 5 actions.
-    
+
     """
-    
+
         return [
-    
+
             {
-    
+
                 "role": "system",
-    
+
                 "content": SYSTEM_PROMPT
-    
+
             },
-    
+
             {
-    
+
                 "role": "user",
-    
+
                 "content": user_prompt
-    
+
             }
-    
+
         ]
+
     def summarize_observation(
             self,
             observation: Dict
@@ -440,6 +495,47 @@ class AgentPlanner:
         }
 
         return summary
+
+    def summarize_memory(
+            self,
+            memory: Dict
+    ):
+        """
+        NEW: mirrors summarize_observation() but for the memory blob.
+        Keeps only what actually helps the model decide the next step -
+        the goal, current task progress, and a short tail of recent
+        actions - and drops everything else (cookies, full page/browser
+        snapshots already covered by summarize_observation, unbounded
+        history, etc.) that was previously dumped in raw.
+        """
+        if not isinstance(memory, dict):
+            return {}
+
+        recent_actions = memory.get("recentActions") or []
+        slim_actions = [
+            {
+                "action": a.get("action"),
+                "args": a.get("args"),
+                "success": bool((a.get("result") or {}).get("success")),
+                "goal": a.get("goal"),
+            }
+            for a in recent_actions[-5:]
+            if isinstance(a, dict)
+        ]
+
+        task = memory.get("task") or {}
+
+        return {
+            "goal": (memory.get("goal") or {}).get("text"),
+            "task": {
+                "currentTask": task.get("currentTask"),
+                "completed": (task.get("completed") or [])[-5:],
+                "pending": (task.get("pending") or [])[:5],
+            },
+            "recentActions": slim_actions,
+            "lastResponse": (memory.get("llmContext") or {}).get("lastResponse", ""),
+        }
+
     def merge_memory(
             self,
             session_id,
@@ -456,15 +552,66 @@ class AgentPlanner:
 
         return merged
 
-    def call_llm(self, messages: List[Dict]):
+    def _call_local_llm(self, messages: List[Dict]) -> str:
+        """
+        Call the local LLM at LLAMA_URL with fast-fail timeouts. Raises
+        on any failure (connection error, timeout, non-2xx, bad body) -
+        callers decide what to do next (retry, fall back, or give up).
+        """
         payload = {"model": MODEL_NAME, "messages": messages, "temperature": 0.15, "max_tokens": 1024}
-        logger.info("🧠 Sending planning request to Rexy...")
-        response = requests.post(LLAMA_URL, json=payload, timeout=120)
+        logger.info("🧠 Sending planning request to local LLM (%s)...", LLAMA_URL)
+        response = requests.post(
+            LLAMA_URL,
+            json=payload,
+            timeout=(LLAMA_CONNECT_TIMEOUT_S, LLAMA_READ_TIMEOUT_S),
+        )
         if not response.ok:
-            logger.warning(f"LLM request failed [{response.status_code}]: {response.text[:2000]}")
+            logger.warning(
+                "Local LLM request failed [%s]: %s",
+                response.status_code, response.text[:2000],
+            )
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"].strip()
+
+    def _call_gemini(self, messages: List[Dict]) -> str:
+        """
+        Fallback path when the local LLM is unreachable/too slow. Only
+        used if GEMINI_API_KEY is configured and google.generativeai
+        initialized successfully at import time.
+        """
+        if not _gemini_model:
+            raise RuntimeError("Gemini fallback not configured (GEMINI_API_KEY missing).")
+
+        logger.info("🧠 Falling back to Gemini (%s)...", GEMINI_MODEL_NAME)
+        # Gemini doesn't use the OpenAI-style role list directly; flatten
+        # the system + user messages into a single prompt instead.
+        combined = "\n\n".join(m["content"] for m in messages)
+        response = _gemini_model.generate_content(
+            combined,
+            generation_config={"temperature": 0.15, "max_output_tokens": 1024},
+        )
+        return (response.text or "").strip()
+
+    def call_llm(self, messages: List[Dict]):
+        """
+        Try the local LLM first (fast-fail on connect/read timeout), and
+        automatically fall back to Gemini if it fails and a fallback is
+        configured. This is what actually fixes "plan timed out": instead
+        of hanging for up to 120s per attempt with nothing to fall back
+        on, an unreachable/slow local server now fails within
+        LLAMA_CONNECT_TIMEOUT_S + LLAMA_READ_TIMEOUT_S seconds and hands
+        off immediately.
+        """
+        try:
+            return self._call_local_llm(messages)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            logger.warning(f"Local LLM unreachable/slow ({e}); trying fallback.")
+        except requests.HTTPError as e:
+            logger.warning(f"Local LLM returned an error ({e}); trying fallback.")
+
+        return self._call_gemini(messages)
+
     def extract_json(
             self,
             text: str
@@ -516,19 +663,44 @@ class AgentPlanner:
         plan["actions"] = valid_actions
 
         return plan
+
     def generate_plan(
             self,
             messages
     ):
-
-        retries = 3
+        """
+        FIX: previously retried up to 3 times with NO distinction between
+        "the model's JSON was malformed" (worth retrying - the model may
+        do better on a second try) and "the LLM call itself failed"
+        (retrying the exact same network failure 3 times just triples
+        the wait for an identical outcome, since call_llm() already
+        tried both the local model AND the Gemini fallback once each).
+        Now: an LLM-call failure (both primary and fallback exhausted)
+        gives up immediately; only bad-JSON/validation failures get
+        retried, and only twice.
+        """
+        max_parse_retries = 2
+        parse_attempts = 0
         last_error = None
 
-        for _ in range(retries):
-
+        while parse_attempts < max_parse_retries:
             try:
-
                 text = self.call_llm(messages)
+            except Exception as e:
+                # Both the local model and the Gemini fallback (if any)
+                # failed. No amount of retrying will fix an unreachable
+                # backend right now - fail fast instead of hanging.
+                logger.error(f"call_llm failed on both primary and fallback: {e}")
+                return {
+                    "complete": False,
+                    "reason": "Planner backend unavailable.",
+                    "actions": [
+                        {"type": "observe"}
+                    ]
+                }
+
+            parse_attempts += 1
+            try:
                 plan = self.extract_json(text)
                 raw_action_count = len(plan.get("actions", []))
 
@@ -560,30 +732,31 @@ class AgentPlanner:
                 {"type": "observe"}
             ]
         }
+
     def sanitize_action(
             self,
             action
     ):
-    
+
         # Normalize common field-name mistakes the model makes.
         if action["type"] == "type":
             if "text" not in action and "value" in action:
                 action["text"] = action.pop("value")
             if "text" not in action and "content" in action:
                 action["text"] = action.pop("content")
-    
+
         if action["type"] == "navigate":
-    
+
             url = action.get("url", "") or action.get("value", "") or action.get("href", "")
-    
+
             if url and not url.startswith("http"):
                 url = "https://" + url
-    
+
             action["url"] = url
-    
+
         if action["type"] == "click" and "selector" not in action and "target" in action:
             action["selector"] = action.pop("target")
-    
+
         return action
 
     def apply_resolved_navigation(
