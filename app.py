@@ -1,13 +1,14 @@
-
 from flask import Flask, request, jsonify, send_from_directory, make_response, send_file
 from Veronica import get_veronica_response, load_knowledge_base, save_knowledge_base
 from flask_cors import CORS
 import os
-from agent import get_agent_plan
+from agent import get_agent_plan, needs_page_content
 import google.generativeai as genai
 import re
 import logging
 import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 import psycopg2
 import psycopg2.extras
@@ -18,6 +19,39 @@ import json
 # ---- Configuration ----
 logging.basicConfig(level=logging.DEBUG)
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------
+# FIX: app.run() used to be called with debug=True and no `threaded`
+# argument at all, which means Flask's development server handled
+# requests ONE AT A TIME on a single thread. Concretely: while a slow
+# summarize/agent request was being processed, every other request -
+# including a completely unrelated chat message from the same or a
+# different user - queued up behind it and got nothing back until the
+# first one finished or timed out. That queueing is exactly what looked
+# like "the agent and chat colliding" / "chat stops responding until
+# the app or server resets". FLASK_DEBUG defaults to false here since
+# debug mode's auto-reloader is a production liability on its own (it
+# runs the app in a child process and can leave stale/duplicate
+# processes behind on a host like Render); set the env var if you want
+# it back for local development.
+# ---------------------------------------------------------------------
+FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+
+# NEW: any single request handler still runs on one thread even with
+# threaded=True - if that handler itself hangs (e.g. Veronica.py calling
+# out to something with no timeout of its own), it still ties up that
+# one thread indefinitely. RESPONSE_TIMEOUT_SECONDS bounds the actual
+# Veronica call so a single stuck request can never hang forever, and
+# gives the person a clear, immediate answer instead of a silent wait.
+RESPONSE_TIMEOUT_SECONDS = int(os.environ.get("RESPONSE_TIMEOUT_SECONDS", "45"))
+_response_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="veronica")
+
+# NEW: hard cap on how much page text a single chat request will ever
+# embed in the LLM prompt, applied even on the "yes, send it now" path -
+# defense in depth on top of the client already capping its own
+# extraction, so a stray huge payload can never balloon token usage or
+# generation time.
+MAX_PAGE_CONTENT_CHARS = int(os.environ.get("MAX_PAGE_CONTENT_CHARS", "4000"))
 
 # Allowed origins (exact matches)
 ALLOWED_ORIGINS = {
@@ -34,6 +68,10 @@ CORS(app, resources={r"/predict": {"origins": list(ALLOWED_ORIGINS)}}, methods=[
 
 # Load knowledge base
 knowledge_base = load_knowledge_base('knowledge_base.json')
+# NEW: /save mutates this global from a request handler; now that Flask
+# runs threaded, guard reads/writes so a save mid-request can't hand a
+# half-updated object to a concurrently running /predict call.
+_knowledge_base_lock = threading.Lock()
 
 # Configure the Gemini model from environment variable (do not hardcode keys)
 
@@ -121,6 +159,20 @@ def get_veronica_response_from_knowledge_or_gemini(text):
     if resp == "Sorry I dont know what you are talking about! ^.^":
         resp = get_gemini_response(text)
     return resp
+
+
+def get_veronica_response_bounded(user_question, kb, session_id):
+    """
+    NEW: runs get_veronica_response() on a worker thread with a hard wall
+    clock limit (RESPONSE_TIMEOUT_SECONDS). If it doesn't finish in time,
+    raises FutureTimeoutError and the caller returns a clear, immediate
+    message instead of leaving the request (and the thread handling it)
+    hanging indefinitely - which is what could make the whole chat look
+    stuck until the process was restarted.
+    """
+    future = _response_executor.submit(get_veronica_response, user_question=user_question, knowledge_base=kb, session_id=session_id)
+    return future.result(timeout=RESPONSE_TIMEOUT_SECONDS)
+
 
 # DEBUG: log incoming requests (helps see if preflight reaches Flask)
 @app.before_request
@@ -362,21 +414,58 @@ def predict():
 
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
-        # --- AI RESPONSE (session-aware with Redis + Gemini) ---
+        # ---------------------------------------------------------------
+        # FIX: this used to unconditionally attach `page_content` (however
+        # much the client sent - previously unbounded) to the prompt on
+        # EVERY chat message, whether the message had anything to do with
+        # the page or not. That's the concrete source of "huge number of
+        # tokens per chat" and the summarize-specific timeouts: a normal
+        # "hello" was paying the same token cost as an actual page
+        # summary.
+        #
+        # New behavior - page content is fetched and used ON DEMAND ONLY:
+        #   1. If the client already sent page_content (it does this only
+        #      when IT already knows content is needed - e.g. the
+        #      dedicated Summarize flow - or when it's resending after
+        #      we asked for it below), use it directly, truncated to a
+        #      safe cap regardless of how much was sent.
+        #   2. Otherwise, ask needs_page_content() - a real JSON/tool-
+        #      calling decision (see agent.py) - whether THIS message
+        #      actually requires the page's text to answer well.
+        #        - If no: answer normally, with no page content at all.
+        #        - If yes: don't call the LLM with a guess at content -
+        #          tell the client we need it and stop here. The client
+        #          (NoahAgentService / ChatService) then fetches the
+        #          page text and resends exactly once with page_content
+        #          attached, landing back in branch (1) above. No loops,
+        #          no repeated back-and-forth beyond that one round trip.
+        # ---------------------------------------------------------------
         if page_content:
+            if len(page_content) > MAX_PAGE_CONTENT_CHARS:
+                page_content = page_content[:MAX_PAGE_CONTENT_CHARS] + "\n...[truncated]"
             augmented_question = (
                 f"Here is the extracted text of the current web page:\n"
                 f"---\n{page_content}\n---\n\n"
                 f"User request: {text}"
             )
         else:
+            if needs_page_content(text):
+                app.logger.info("Chat message needs page content but none was sent yet; requesting it from the client.")
+                return jsonify({"needs_page_content": True}), 200
             augmented_question = text
 
-        response = get_veronica_response(
-            user_question=augmented_question,
-            knowledge_base=knowledge_base,
-            session_id=session_id
-        )
+        with _knowledge_base_lock:
+            kb_snapshot = knowledge_base
+
+        try:
+            response = get_veronica_response_bounded(
+                user_question=augmented_question,
+                kb=kb_snapshot,
+                session_id=session_id
+            )
+        except FutureTimeoutError:
+            app.logger.warning(f"get_veronica_response timed out after {RESPONSE_TIMEOUT_SECONDS}s for session {session_id}")
+            response = "Sorry, that's taking longer than expected to think through — please try again in a moment."
 
         # log user message and bot response to DB (non-blocking)
         try:
@@ -473,10 +562,17 @@ def save():
     global knowledge_base
     new_knowledge_base = request.get_json().get("knowledge_base")
     save_knowledge_base(new_knowledge_base, 'knowledge_base.json')
-    knowledge_base = new_knowledge_base
+    with _knowledge_base_lock:
+        knowledge_base = new_knowledge_base
     return jsonify({"message": "Knowledge base saved successfully!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    
-    app.run(host='0.0.0.0', port=port, debug=True)
+
+    # FIX: threaded=True is the actual fix for "agent and chat collide" -
+    # without it, Werkzeug's dev server serializes every request onto one
+    # thread, so one slow agent/summarize call blocks all other traffic
+    # until it finishes or times out. debug now defaults off (see
+    # FLASK_DEBUG above); set FLASK_DEBUG=true in the environment for
+    # local development if you want the reloader back.
+    app.run(host='0.0.0.0', port=port, debug=FLASK_DEBUG, threaded=True)
