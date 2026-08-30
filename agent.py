@@ -2,6 +2,7 @@ import json
 import os
 import re
 import logging
+import threading
 import requests
 from typing import Dict, List, Any, Optional
 
@@ -24,11 +25,11 @@ MODEL_NAME = os.getenv(
 )
 
 # ---------------------------------------------------------------------
-# FIX: the local LLM call used a single 120s timeout with a 3x retry loop
-# around it (up to 360s before ever giving up), and no automatic fallback
-# if that local server was unreachable or too slow to respond in time —
-# which is exactly what "Read timed out (read timeout=120)" in the logs
-# was. Two independent knobs now control this:
+# FIX: the local LLM call used to have a single 120s timeout with a 3x
+# retry loop around it (up to 360s before ever giving up), and no
+# automatic fallback if that local server was unreachable or too slow to
+# respond in time - which is exactly what "Read timed out (read
+# timeout=120)" in the logs was. Two independent knobs now control this:
 #
 #   LLAMA_CONNECT_TIMEOUT_S - how long to wait for the TCP connection to
 #     even establish. If nothing is listening on LLAMA_URL at all, this
@@ -45,6 +46,14 @@ MODEL_NAME = os.getenv(
 # ---------------------------------------------------------------------
 LLAMA_CONNECT_TIMEOUT_S = float(os.getenv("LLAMA_CONNECT_TIMEOUT_S", "5"))
 LLAMA_READ_TIMEOUT_S = float(os.getenv("LLAMA_READ_TIMEOUT_S", "45"))
+
+# NEW: dedicated, much shorter timeouts for the page-content classifier
+# (see needs_page_content() below). It's a tiny yes/no JSON decision, not
+# a full plan - if it can't get an answer almost immediately, defaulting
+# to "no" and answering without page content is far better than making
+# a normal chat message wait on a second slow LLM round trip.
+CLASSIFIER_CONNECT_TIMEOUT_S = float(os.getenv("CLASSIFIER_CONNECT_TIMEOUT_S", "3"))
+CLASSIFIER_READ_TIMEOUT_S = float(os.getenv("CLASSIFIER_READ_TIMEOUT_S", "8"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
@@ -159,6 +168,95 @@ def extract_navigation_target(goal: str) -> Optional[str]:
         return None
 
     return target
+
+
+# ================================
+# On-demand page-content decision (JSON/tool-calling)
+# ================================
+
+# NEW: fast local pre-filter for the obvious case. If the message
+# plainly asks about "this page" / "summarize" / etc., there's no need
+# to spend an LLM call just to confirm what's already certain - this
+# keeps the common, explicit case (the Summarize button, or someone
+# typing "summarize this") just as fast as before, with zero added
+# round trips, while still being a real, deterministic decision made
+# before any page content is touched.
+_PAGE_CONTENT_HINTS = re.compile(
+    r'\b(this page|this site|this article|this website|current page|'
+    r'summariz|summary|tl;?dr|what does this say|what is this about)\b',
+    re.IGNORECASE
+)
+
+
+def _classify_needs_page_content_via_llm(message: str) -> Optional[bool]:
+    """
+    The actual JSON/tool-calling decision: ask the model itself whether
+    it needs the page's text to answer well. Returns True/False, or None
+    if the classifier call failed for any reason (caller should then
+    default to False rather than block the chat on a broken classifier).
+    """
+    prompt = (
+        "A browser assistant received this message from a user who has a "
+        "webpage open:\n\n"
+        f"\"{message}\"\n\n"
+        "Decide whether answering this well requires reading the actual "
+        "text/content of the currently open webpage (e.g. summarizing it, "
+        "answering a question about what's on the page, extracting "
+        "specific information from it) versus a general question, greeting, "
+        "or something answerable without seeing the page at all.\n\n"
+        "Respond with ONLY this JSON object and nothing else:\n"
+        '{"needs_page_content": true}\n'
+        "or\n"
+        '{"needs_page_content": false}'
+    )
+    try:
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": 20,
+        }
+        response = requests.post(
+            LLAMA_URL,
+            json=payload,
+            timeout=(CLASSIFIER_CONNECT_TIMEOUT_S, CLASSIFIER_READ_TIMEOUT_S),
+        )
+        response.raise_for_status()
+        text = response.json()["choices"][0]["message"]["content"].strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        parsed = json.loads(text[start:end + 1])
+        value = parsed.get("needs_page_content")
+        return bool(value) if isinstance(value, bool) else None
+    except Exception as e:
+        logger.warning(f"needs_page_content classifier failed: {e}")
+        return None
+
+
+def needs_page_content(message: str) -> bool:
+    """
+    The single entry point app.py's chat branch calls before deciding
+    whether to include page content in the prompt at all. This is what
+    "stop sending website contents with every chat message" and "expose
+    summarize through JSON/tool calling" both cash out to concretely:
+    page content is never attached by default - it's only fetched and
+    used once something (the fast local hint match, or the LLM
+    classifier for ambiguous phrasing) has actually decided it's needed
+    for THIS message.
+
+    Fails safe: any classifier error defaults to False (don't require
+    page content) rather than blocking or erroring the chat.
+    """
+    if not message:
+        return False
+
+    if _PAGE_CONTENT_HINTS.search(message):
+        return True
+
+    result = _classify_needs_page_content_via_llm(message)
+    return result if result is not None else False
 
 
 # ================================
@@ -313,6 +411,12 @@ class AgentPlanner:
     def __init__(self):
 
         self.session_memory = {}
+        # NEW: app.py now runs Flask with threaded=True so a slow request
+        # (an agent plan, a classifier call, a Veronica response) never
+        # blocks every other in-flight request - including other agent
+        # sessions hitting this same shared dict concurrently. This lock
+        # keeps remember()/recall() race-free under that concurrency.
+        self._memory_lock = threading.Lock()
 
         logger.info("🧠 Noah Agent Planner Initialized")
 
@@ -320,12 +424,14 @@ class AgentPlanner:
                  session_id: str,
                  memory: Dict):
 
-        self.session_memory[session_id] = memory
+        with self._memory_lock:
+            self.session_memory[session_id] = memory
 
     def recall(self,
                session_id: str):
 
-        return self.session_memory.get(session_id, {})
+        with self._memory_lock:
+            return self.session_memory.get(session_id, {})
 
     def build_prompt(
             self,
@@ -677,7 +783,7 @@ class AgentPlanner:
         tried both the local model AND the Gemini fallback once each).
         Now: an LLM-call failure (both primary and fallback exhausted)
         gives up immediately; only bad-JSON/validation failures get
-        retried, and only twice.
+        retried, and only once (max_parse_retries=2 total attempts).
         """
         max_parse_retries = 2
         parse_attempts = 0
