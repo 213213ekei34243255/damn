@@ -133,7 +133,12 @@ import requests
 LLAMA_URL = "http://127.0.0.1:8080/v1/chat/completions"
 
 
-def get_llama_response(user_question: str, session_id: str, web_context: str = "") -> str:
+def get_llama_response(
+    user_question: str,
+    session_id: str,
+    web_context: str = "",
+    page_content: str = ""
+) -> str:
 
     # Encode query
     user_emb = model_embed.encode(
@@ -184,7 +189,11 @@ def get_llama_response(user_question: str, session_id: str, web_context: str = "
             "already know or said earlier in this conversation. Your own training data has a knowledge cutoff and "
             "can be out of date - if a Web Search Results block conflicts with your training knowledge OR with "
             "something said earlier in this chat history, the Web Search Results block wins. Never repeat or default "
-            "back to an older answer from earlier in the conversation once fresher Web Search Results are provided.
+            "back to an older answer from earlier in the conversation once fresher Web Search Results are provided.\n"
+            "When a 'Current Web Page' block below is present, that is the actual text of the page the user has "
+            "open right now in their browser. Use it as the primary source for summarizing the page or answering "
+            "any question about 'this page'/'this article'/'this site'. It reflects exactly what the user is "
+            "looking at - trust it over your own general knowledge about the topic if the two ever disagree.
         """
         }
     ]
@@ -220,6 +229,23 @@ def get_llama_response(user_question: str, session_id: str, web_context: str = "
                 "anything said earlier in this conversation):\n"
                 f"{web_context}"
             )
+        })
+
+    # FIX: page_content used to get string-concatenated directly onto
+    # user_question by app.py before it ever reached this function -
+    # meaning THIS function had no idea a "user question" was actually
+    # "the entire Wikipedia article, plus a question" and passed that
+    # whole blob into find_best_match()/needs_web_search() upstream in
+    # get_veronica_response(), which is exactly what caused DuckDuckGo
+    # to receive the full page text as its search query and time out.
+    # page_content now arrives as its own parameter and gets its own
+    # clearly-labeled block here, right next to (but distinct from) the
+    # web search results block - the user's actual question stays clean
+    # everywhere else in this file.
+    if page_content:
+        messages.append({
+            "role": "system",
+            "content": f"Current Web Page (the page the user has open right now):\n{page_content}"
         })
 
     messages.append({
@@ -286,7 +312,12 @@ def handle_stream_query(query, data):
             return "\n".join(results)
 
     return None
-def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: str) -> str:
+def get_veronica_response(
+    user_question: str,
+    knowledge_base: Dict,
+    session_id: str,
+    page_content: str = ""
+) -> str:
     # quick utility commands
     if user_question.lower() == 'date':
         answer = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}"
@@ -310,6 +341,13 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
             return answer
 
     # Try FAQ/knowledge base first
+    # FIX: user_question is now always the person's actual plain
+    # question/message - page_content (when present) is a separate
+    # parameter, never concatenated into this string. Previously,
+    # whenever a page was open, this ran a fuzzy match against the
+    # ENTIRE extracted page text glued onto the question, which could
+    # never sensibly match a short FAQ entry and only wasted a
+    # difflib pass over a huge string every time.
     best_match = find_best_match(
         user_question,
         [q.get("question") for q in knowledge_base.get("questions", [])]
@@ -318,16 +356,22 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
     if best_match:
         answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
     else:
-        # NEW: only search the web when the question actually looks like
-        # it needs fresh/current info (see needs_web_search in
-        # web_search.py) - not for every message. Chit-chat ("Hey"),
-        # general knowledge, science, theories, and explanations the LLM
-        # already knows go straight to the model without burning a
-        # search call. Only things like current events, prices, scores,
-        # "who currently holds X", or an explicit "search for..." request
-        # trigger a real web search.
+        # FIX: web search is now skipped entirely whenever page_content
+        # is present. If the user already has a page open and Noah
+        # already has its text, there's never a legitimate reason to
+        # ALSO hit an external search engine for the same request -
+        # doing so previously meant needs_web_search()/build_web_context()
+        # received the *entire page content glued onto the question* as
+        # their input, and DuckDuckGo ended up being asked to "search"
+        # for a multi-thousand-character Wikipedia article, which just
+        # timed out on every attempt and added pure latency to every
+        # single summarize/follow-up request for no benefit at all.
+        #
+        # When there's no page content (a normal chat message), the
+        # existing behavior is unchanged: only search the web when the
+        # question actually looks like it needs fresh/current info.
         web_context = ""
-        if needs_web_search(user_question):
+        if not page_content and needs_web_search(user_question):
             try:
                 web_context = build_web_context(user_question)
             except Exception:
@@ -336,7 +380,12 @@ def get_veronica_response(user_question: str, knowledge_base: Dict, session_id: 
                 # erroring out.
                 web_context = ""
 
-        answer = get_llama_response(user_question, session_id, web_context=web_context)
+        answer = get_llama_response(
+            user_question,
+            session_id,
+            web_context=web_context,
+            page_content=page_content
+        )
 
     # Save this turn in Redis so future messages have context
     save_message(session_id, "user", user_question)
