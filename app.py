@@ -161,7 +161,7 @@ def get_veronica_response_from_knowledge_or_gemini(text):
     return resp
 
 
-def get_veronica_response_bounded(user_question, kb, session_id):
+def get_veronica_response_bounded(user_question, kb, session_id, page_content=""):
     """
     NEW: runs get_veronica_response() on a worker thread with a hard wall
     clock limit (RESPONSE_TIMEOUT_SECONDS). If it doesn't finish in time,
@@ -170,7 +170,13 @@ def get_veronica_response_bounded(user_question, kb, session_id):
     hanging indefinitely - which is what could make the whole chat look
     stuck until the process was restarted.
     """
-    future = _response_executor.submit(get_veronica_response, user_question=user_question, knowledge_base=kb, session_id=session_id)
+    future = _response_executor.submit(
+        get_veronica_response,
+        user_question=user_question,
+        knowledge_base=kb,
+        session_id=session_id,
+        page_content=page_content
+    )
     return future.result(timeout=RESPONSE_TIMEOUT_SECONDS)
 
 
@@ -415,20 +421,26 @@ def predict():
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
         # ---------------------------------------------------------------
-        # FIX: this used to unconditionally attach `page_content` (however
-        # much the client sent - previously unbounded) to the prompt on
-        # EVERY chat message, whether the message had anything to do with
-        # the page or not. That's the concrete source of "huge number of
-        # tokens per chat" and the summarize-specific timeouts: a normal
-        # "hello" was paying the same token cost as an actual page
-        # summary.
+        # FIX: this used to glue page_content directly into a single
+        # "augmented_question" string before ever calling
+        # get_veronica_response() - which meant Veronica.py had no way
+        # to tell "the user's actual question" apart from "the user's
+        # question plus an entire webpage of text". That combined blob
+        # got used as the input to the FAQ fuzzy-matcher AND to the
+        # web-search-necessity check, and when a big page was open,
+        # DuckDuckGo ended up being asked to search for the literal text
+        # of the whole page - which is exactly what was timing out and
+        # slowing down every single summarize/follow-up request.
         #
-        # New behavior - page content is fetched and used ON DEMAND ONLY:
-        #   1. If the client already sent page_content (it does this only
-        #      when IT already knows content is needed - e.g. the
+        # New behavior - page content is fetched and used ON DEMAND
+        # ONLY, and kept as its own separate value the whole way through
+        # (never concatenated into the question string):
+        #   1. If the client already sent page_content (it does this
+        #      only when IT already knows content is needed - e.g. the
         #      dedicated Summarize flow - or when it's resending after
-        #      we asked for it below), use it directly, truncated to a
-        #      safe cap regardless of how much was sent.
+        #      we asked for it below), pass it straight through to
+        #      Veronica as its own parameter, truncated to a safe cap
+        #      regardless of how much was sent.
         #   2. Otherwise, ask needs_page_content() - a real JSON/tool-
         #      calling decision (see agent.py) - whether THIS message
         #      actually requires the page's text to answer well.
@@ -443,25 +455,20 @@ def predict():
         if page_content:
             if len(page_content) > MAX_PAGE_CONTENT_CHARS:
                 page_content = page_content[:MAX_PAGE_CONTENT_CHARS] + "\n...[truncated]"
-            augmented_question = (
-                f"Here is the extracted text of the current web page:\n"
-                f"---\n{page_content}\n---\n\n"
-                f"User request: {text}"
-            )
         else:
             if needs_page_content(text):
                 app.logger.info("Chat message needs page content but none was sent yet; requesting it from the client.")
                 return jsonify({"needs_page_content": True}), 200
-            augmented_question = text
 
         with _knowledge_base_lock:
             kb_snapshot = knowledge_base
 
         try:
             response = get_veronica_response_bounded(
-                user_question=augmented_question,
+                user_question=text,
                 kb=kb_snapshot,
-                session_id=session_id
+                session_id=session_id,
+                page_content=page_content
             )
         except FutureTimeoutError:
             app.logger.warning(f"get_veronica_response timed out after {RESPONSE_TIMEOUT_SECONDS}s for session {session_id}")
