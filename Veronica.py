@@ -258,26 +258,78 @@ def get_llama_response(
             json.dumps(messages, indent=2, ensure_ascii=False)
         )
 
-    payload = {
-        "model": "local",
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 512
-    }
-
-    try:
-
-        r = requests.post(
+    def _post(msgs):
+        return requests.post(
             LLAMA_URL,
-            json=payload,
+            json={"model": "local", "messages": msgs, "temperature": 0.7, "max_tokens": 512},
             timeout=120
         )
 
+    try:
+
+        r = _post(messages)
         r.raise_for_status()
-
         result = r.json()
-
         return result["choices"][0]["message"]["content"].strip()
+
+    except requests.HTTPError as e:
+        # FIX: r.raise_for_status() only raised "400 Client Error: Bad
+        # Request for url: ..." - it never surfaced WHAT the server
+        # actually objected to, which is the one thing needed to fix a
+        # persistent 400. Some local model chat templates (Gemma-family
+        # is the best-known case) reject "role": "system" outright,
+        # which fits exactly what was observed: every single message
+        # failing identically, even the very first message of a brand
+        # new session with no history yet - a shape/ordering bug would
+        # only show up once history existed, not on turn one. So: one
+        # automatic retry, folding the system content into the leading
+        # user message instead of a system role, before giving up.
+        body = ""
+        try:
+            body = e.response.text[:500] if e.response is not None else ""
+        except Exception:
+            pass
+        logger.warning(
+            "Local LLM rejected request with a system message [%s]: %s - retrying without a system role.",
+            e.response.status_code if e.response is not None else "?",
+            body,
+        )
+
+        try:
+            no_system_messages = []
+            for i, m in enumerate(messages):
+                if m["role"] == "system":
+                    # Fold into the next message if there is one, else
+                    # send standalone as a user turn.
+                    if i + 1 < len(messages):
+                        continue
+                    no_system_messages.append({"role": "user", "content": m["content"]})
+                else:
+                    no_system_messages.append(m)
+            # Prepend all system content onto the first non-system message.
+            system_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+            if system_text and no_system_messages and no_system_messages[0]["role"] != "system":
+                no_system_messages[0] = {
+                    "role": no_system_messages[0]["role"],
+                    "content": f"{system_text}\n\n{no_system_messages[0]['content']}"
+                }
+
+            r2 = _post(no_system_messages)
+            r2.raise_for_status()
+            result2 = r2.json()
+            return result2["choices"][0]["message"]["content"].strip()
+
+        except Exception as retry_error:
+            retry_body = ""
+            try:
+                retry_body = retry_error.response.text[:500] if getattr(retry_error, "response", None) is not None else ""
+            except Exception:
+                pass
+            logger.error(
+                "Retry without system role also failed: %s | server said: %s",
+                retry_error, retry_body,
+            )
+            return f"Local model error: {e} | server said: {body or retry_body}"
 
     except Exception as e:
 
