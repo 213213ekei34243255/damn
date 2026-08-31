@@ -175,10 +175,22 @@ def get_llama_response(
 
     history = load_history(session_id, limit=8)
 
-    messages = [
-        {
-            "role": "system",
-            "content": """
+    # FIX: this used to build [system(persona), ...history..., system(KB),
+    # system(web), system(page_content), user(question)] - THREE separate
+    # system-role messages landing AFTER the chat history, breaking the
+    # strict "system first, then alternating user/assistant" shape that
+    # most local chat templates (Llama-3-style especially) enforce when
+    # applying their template. That mismatch is what llama.cpp's server
+    # was rejecting with "400 Bad Request" - adding the new page_content
+    # block as a third stray system message was what tipped a
+    # previously-marginal structure over into a hard failure.
+    #
+    # Fix: build ONE combined system message up front (persona + any
+    # extra context blocks, each still clearly labeled so the model can
+    # tell them apart), THEN the alternating history, THEN the user's
+    # question last. This keeps every local LLM's chat template happy
+    # regardless of how strict it is about role ordering.
+    system_sections = ["""
            "You are Noah, Working in Jonah Browser you were made by CogniAI Studios , and your architecture is Rexy 1\n"
             "Answer all the questions asked by the user check Internet and then answer web related answers have modern american language like bruh and then being too human way\n"
             "When you are given a 'Web Search Results' block below, treat it as freshly retrieved, up-to-date information - use it to answer, "
@@ -194,58 +206,44 @@ def get_llama_response(
             "open right now in their browser. Use it as the primary source for summarizing the page or answering "
             "any question about 'this page'/'this article'/'this site'. It reflects exactly what the user is "
             "looking at - trust it over your own general knowledge about the topic if the two ever disagree.
-        """
+        """]
+
+    if context:
+        system_sections.append(
+            f"Knowledge Base (only use this if it's actually relevant to the question below):\n{context}"
+        )
+
+    # Web search results and page content go last among the system
+    # sections (closest, in reading order, to where history/the question
+    # will follow), since smaller local models tend to weight later
+    # context more heavily - same reasoning as before, just now all
+    # still safely inside the single leading system message.
+    if web_context:
+        system_sections.append(
+            "Web Search Results (live, fetched just now - this is more "
+            "current than your training data and more current than "
+            "anything said earlier in this conversation):\n"
+            f"{web_context}"
+        )
+
+    if page_content:
+        system_sections.append(
+            f"Current Web Page (the page the user has open right now):\n{page_content}"
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": "\n\n".join(system_sections)
         }
     ]
 
-    # History goes before the fresh context blocks below (not after), so
-    # the most current information - the actual answer to THIS question -
-    # sits closest to the user's question at the end of the prompt. Many
-    # models (especially smaller local ones) weight the end of the prompt
-    # most heavily, so burying fresh web results under a pile of older
-    # chat history was letting stale prior answers win out.
+    # History follows the single system message, then the user's
+    # question last - a clean, strictly-alternating shape.
     for m in history:
         messages.append({
             "role": m["role"],
             "content": m["text"]
-        })
-
-    if context:
-        messages.append({
-            "role": "system",
-            "content": f"Knowledge Base (only use this if it's actually relevant to the question below):\n{context}"
-        })
-
-    # NEW: inject freshly retrieved web search context, if any - placed
-    # last among the system messages, immediately before the user's
-    # question, so it's the freshest thing in the model's "recent memory"
-    # when it generates its answer.
-    if web_context:
-        messages.append({
-            "role": "system",
-            "content": (
-                "Web Search Results (live, fetched just now - this is more "
-                "current than your training data and more current than "
-                "anything said earlier in this conversation):\n"
-                f"{web_context}"
-            )
-        })
-
-    # FIX: page_content used to get string-concatenated directly onto
-    # user_question by app.py before it ever reached this function -
-    # meaning THIS function had no idea a "user question" was actually
-    # "the entire Wikipedia article, plus a question" and passed that
-    # whole blob into find_best_match()/needs_web_search() upstream in
-    # get_veronica_response(), which is exactly what caused DuckDuckGo
-    # to receive the full page text as its search query and time out.
-    # page_content now arrives as its own parameter and gets its own
-    # clearly-labeled block here, right next to (but distinct from) the
-    # web search results block - the user's actual question stays clean
-    # everywhere else in this file.
-    if page_content:
-        messages.append({
-            "role": "system",
-            "content": f"Current Web Page (the page the user has open right now):\n{page_content}"
         })
 
     messages.append({
