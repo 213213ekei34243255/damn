@@ -65,6 +65,40 @@ logger = logging.getLogger("Veronica")
 # right before it declined.
 DEBUG_PROMPTS = os.getenv("VERONICA_DEBUG_PROMPTS", "0") == "1"
 
+# NEW: strip raw URLs out of web_context before it ever reaches the
+# model's prompt. Two reasons this matters:
+#   1. The client's ghost-search "Source links:" block isn't just article
+#      URLs - it includes Google's own chrome links: accounts.google.com
+#      ServiceLogin redirects with an encoded `continue=` param, and
+#      googleapp://lens deep links via iga.google.com. Those resemble
+#      the kind of tracking/phishing-style redirect URLs some
+#      safety-tuned local models are trained to flag, and could be
+#      contributing to outright refusals on unrelated questions.
+#   2. Even setting that aside, raw long URLs add prompt-token noise for
+#      zero informational value - the model only needs the headline/
+#      snippet text, never the literal link.
+# Note: this is one candidate fix for model refusals, not a guaranteed
+# one - a refusal can also be topic-driven (e.g. a mass-casualty
+# disaster question), which stripping URLs won't change. Use the
+# refusal-warning log added below to check whether refusals stop after
+# this change; if they don't, the cause is more likely topical.
+def _strip_urls_from_web_context(text: str) -> str:
+    if not text:
+        return text
+    # Cut off the "Source links:" section entirely - pure link dump,
+    # no informational value on its own.
+    text = re.split(r'\n\s*Source links:\s*\n', text, maxsplit=1)[0]
+    # Strip any remaining raw URLs elsewhere in the text (e.g. the
+    # "[n] Title — url" format used by web_search.py's build_web_context
+    # fallback path), leaving just the title/snippet content.
+    text = re.sub(r'https?://\S+', '', text)
+    # Clean up dangling separators/whitespace left behind (e.g.
+    # "Title — " with nothing after the dash) and collapse blank lines.
+    text = re.sub(r'—\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 # Minimum semantic-search similarity score (0-1) for a knowledge-base
 # chunk to be included in the prompt. Below this, a chunk is almost
 # certainly irrelevant to the question (e.g. college document chunks
@@ -199,6 +233,9 @@ def get_llama_response(
         system_sections.append(
             f"Knowledge Base (only use this if it's actually relevant to the question below):\n{context}"
         )
+
+    if web_context:
+        web_context = _strip_urls_from_web_context(web_context)
 
     if web_context:
         system_sections.append(
