@@ -8,6 +8,7 @@ import re
 import logging
 import uuid
 import threading
+from web_search import needs_web_search
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 import psycopg2
@@ -161,21 +162,14 @@ def get_veronica_response_from_knowledge_or_gemini(text):
     return resp
 
 
-def get_veronica_response_bounded(user_question, kb, session_id, page_content=""):
-    """
-    NEW: runs get_veronica_response() on a worker thread with a hard wall
-    clock limit (RESPONSE_TIMEOUT_SECONDS). If it doesn't finish in time,
-    raises FutureTimeoutError and the caller returns a clear, immediate
-    message instead of leaving the request (and the thread handling it)
-    hanging indefinitely - which is what could make the whole chat look
-    stuck until the process was restarted.
-    """
+def get_veronica_response_bounded(user_question, kb, session_id, page_content="", web_content=""):
     future = _response_executor.submit(
         get_veronica_response,
         user_question=user_question,
         knowledge_base=kb,
         session_id=session_id,
-        page_content=page_content
+        page_content=page_content,
+        web_content=web_content
     )
     return future.result(timeout=RESPONSE_TIMEOUT_SECONDS)
 
@@ -217,6 +211,7 @@ def predict():
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
         url = request_data.get('url')
         page_content = request_data.get('page_content', '')
+        web_content = request_data.get('web_content', '')
         
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
 
@@ -452,13 +447,21 @@ def predict():
         #          attached, landing back in branch (1) above. No loops,
         #          no repeated back-and-forth beyond that one round trip.
         # ---------------------------------------------------------------
-        if page_content:
+         if page_content:
             if len(page_content) > MAX_PAGE_CONTENT_CHARS:
                 page_content = page_content[:MAX_PAGE_CONTENT_CHARS] + "\n...[truncated]"
         else:
             if needs_page_content(text):
                 app.logger.info("Chat message needs page content but none was sent yet; requesting it from the client.")
                 return jsonify({"needs_page_content": True}), 200
+
+        # NEW: same round-trip shape as needs_page_content above, but for
+        # search. If the client hasn't attached web_content yet, tell it
+        # to go fetch some with its own browser (the ghost WKWebView tab)
+        # instead of this server calling Serper/Brave/DuckDuckGo itself.
+        if not web_content and needs_web_search(text):
+            app.logger.info("Chat message needs a web search; asking the client to search with its own browser.")
+            return jsonify({"needs_web_search": True, "search_query": text}), 200
 
         with _knowledge_base_lock:
             kb_snapshot = knowledge_base
@@ -468,7 +471,8 @@ def predict():
                 user_question=text,
                 kb=kb_snapshot,
                 session_id=session_id,
-                page_content=page_content
+                page_content=page_content,
+                web_content=web_content
             )
         except FutureTimeoutError:
             app.logger.warning(f"get_veronica_response timed out after {RESPONSE_TIMEOUT_SECONDS}s for session {session_id}")
