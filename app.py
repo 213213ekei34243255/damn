@@ -8,7 +8,8 @@ import re
 import logging
 import uuid
 import threading
-from web_search import needs_web_search
+from web_search import needs_web_search, _EXPLICIT_SEARCH_PATTERN, _EXPLICIT_SEARCH_GENERIC_PATTERN
+from Veronica import load_history
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 import psycopg2
@@ -129,6 +130,60 @@ def get_veronica_response_bounded(user_question, kb, session_id, page_content=""
         web_content=web_content
     )
     return future.result(timeout=RESPONSE_TIMEOUT_SECONDS)
+
+
+# NEW: when the current message is just a bare instruction ("check the
+# web", "no you're wrong check the web", "verify that") with no real
+# subject of its own, searching for its literal text produces useless
+# results (e.g. "check the web" -> a website-security-scanner tool,
+# nothing to do with whatever the user actually asked two turns ago).
+# This strips known instruction phrasing out of the current message; if
+# what's left is too short to be a real subject, it walks back through
+# this session's Redis history to find the last substantive user
+# question and uses THAT as the search query instead.
+_INSTRUCTION_STRIP_PATTERN = re.compile(
+    r'\b(no,?\s*)?(you\'?re\s+wrong|you\s+are\s+wrong)?,?\s*(please\s*)?(can\s+you\s*)?'
+    r'(search (the web |online )?for|look up|check online|check the web|'
+    r'google (it|this|that)|search the internet|browse (the web|online) for|'
+    r'find (me )?(info|information|news) (on|about)|'
+    r'search|check|look|browse|google|verify(\s+that)?|confirm(\s+that)?)\b',
+    re.IGNORECASE
+)
+
+
+def resolve_search_query(current_text: str, session_id: str) -> str:
+    stripped = _INSTRUCTION_STRIP_PATTERN.sub('', current_text).strip(" ?.!,\"'")
+    # A handful of leftover words (e.g. "and tell me who is playing...")
+    # still carries the real subject, so don't discard it - only fall
+    # back to history when almost nothing informative is left.
+    if len(stripped.split()) >= 3:
+        return current_text
+
+    try:
+        history = load_history(session_id, limit=8)
+    except Exception:
+        app.logger.exception("resolve_search_query: failed to load history for session %s", session_id)
+        return current_text
+
+    for m in reversed(history):
+        if m.get("role") != "user":
+            continue
+        candidate = (m.get("text") or "").strip()
+        if not candidate:
+            continue
+        # Skip if the earlier message is itself just another bare
+        # instruction - keep walking back for the real question.
+        remaining = _INSTRUCTION_STRIP_PATTERN.sub('', candidate).strip(" ?.!,\"'")
+        if len(remaining.split()) >= 3:
+            app.logger.info(
+                "[search-query-resolve] session=%s bare_message=%r -> using prior question=%r",
+                session_id, current_text, candidate
+            )
+            return candidate
+
+    # Nothing usable found in history - fall back to the original text,
+    # same as before this fix.
+    return current_text
 
 
 @app.before_request
@@ -333,7 +388,8 @@ def predict():
 
         if not web_content and needs_web_search(text):
             app.logger.info("Chat message needs a web search; asking the client to search with its own browser.")
-            return jsonify({"needs_web_search": True, "search_query": text}), 200
+            search_query = resolve_search_query(text, session_id)
+            return jsonify({"needs_web_search": True, "search_query": search_query}), 200
 
         with _knowledge_base_lock:
             kb_snapshot = knowledge_base
