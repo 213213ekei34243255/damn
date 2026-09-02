@@ -161,6 +161,16 @@ def needs_web_search(question: str) -> bool:
          than its training data provides.
     """
     q = question.strip().lower()
+    # FIX: collapse any run of whitespace (double spaces from dictation/
+    # autocorrect, tabs, newlines pasted in, etc.) down to single spaces
+    # BEFORE any matching happens below. Without this, a message like
+    # "Who  is playing..." (double space) silently fails every substring
+    # check in WEB_SEARCH_TRIGGERS - "who is playing" (single space) is
+    # not a substring of "who  is playing" (double space) - and falls
+    # through to the default `return False` with no error or warning.
+    # This is exactly what happened with a real dictated/autocorrected
+    # question and caused it to skip search entirely.
+    q = re.sub(r'\s+', ' ', q)
 
     if not q:
         return False
