@@ -12,8 +12,6 @@ from openai import OpenAI
 # NEW: free, keyless web search (DuckDuckGo) support
 from web_search import build_web_context, needs_web_search
 
-# Initialize DeepSeek client
-
 
 # Function to load the knowledge base from a JSON file
 def load_knowledge_base(file_path: str) -> dict:
@@ -61,8 +59,10 @@ logger = logging.getLogger("Veronica")
 
 # Set VERONICA_DEBUG_PROMPTS=1 in your environment to log the exact
 # messages array sent to the LLM for every turn. Useful for diagnosing
-# cases where the model seems to ignore web search / RAG context - you
-# can see precisely what it was given.
+# cases where the model seems to ignore web search / RAG context, OR
+# where the model is refusing to answer altogether (as opposed to a
+# plumbing/search failure) - you can see precisely what it was given
+# right before it declined.
 DEBUG_PROMPTS = os.getenv("VERONICA_DEBUG_PROMPTS", "0") == "1"
 
 # Minimum semantic-search similarity score (0-1) for a knowledge-base
@@ -154,13 +154,6 @@ def get_llama_response(
         top_k=20
     )[0]
 
-    # NEW: only keep chunks that are actually relevant to this question.
-    # Previously EVERY chunk in the top_k=20 was injected regardless of
-    # how weak the match was, which means an unrelated question (e.g. a
-    # sports score) still pulled in a wall of irrelevant college-document
-    # text under a "Knowledge Base:" header. That's noise at best, and at
-    # worst it competes for the model's attention against the actually
-    # relevant "Web Search Results" block sitting right next to it.
     relevant_hits = [h for h in hits if h.get("score", 0) >= RAG_SCORE_THRESHOLD]
 
     retrieved_chunks = [
@@ -175,21 +168,6 @@ def get_llama_response(
 
     history = load_history(session_id, limit=8)
 
-    # FIX: this used to build [system(persona), ...history..., system(KB),
-    # system(web), system(page_content), user(question)] - THREE separate
-    # system-role messages landing AFTER the chat history, breaking the
-    # strict "system first, then alternating user/assistant" shape that
-    # most local chat templates (Llama-3-style especially) enforce when
-    # applying their template. That mismatch is what llama.cpp's server
-    # was rejecting with "400 Bad Request" - adding the new page_content
-    # block as a third stray system message was what tipped a
-    # previously-marginal structure over into a hard failure.
-    #
-    # Fix: build ONE combined system message up front (persona + any
-    # extra context blocks, each still clearly labeled so the model can
-    # tell them apart), THEN the alternating history, THEN the user's
-    # question last. This keeps every local LLM's chat template happy
-    # regardless of how strict it is about role ordering.
     system_sections = ["""
            "You are Noah, Working in Jonah Browser you were made by CogniAI Studios , and your architecture is Rexy 1\n"
             "Answer all the questions asked by the user check Internet and then answer web related answers have modern american language like bruh and then being too human way\n"
@@ -205,7 +183,16 @@ def get_llama_response(
             "When a 'Current Web Page' block below is present, that is the actual text of the page the user has "
             "open right now in their browser. Use it as the primary source for summarizing the page or answering "
             "any question about 'this page'/'this article'/'this site'. It reflects exactly what the user is "
-            "looking at - trust it over your own general knowledge about the topic if the two ever disagree.
+            "looking at - trust it over your own general knowledge about the topic if the two ever disagree.\n"
+            "NEW: The Web Search Results are ordinary public search-engine results - the same thing anyone would "
+            "see typing the question into Google themselves. This includes routine entertainment/news topics like "
+            "movie casting, actors playing roles, release dates, and celebrity news reported by mainstream outlets "
+            "and fan communities - this is public, widely-reported information, not private, sensitive, or harmful "
+            "content, so answer these questions directly and factually using the Web Search Results provided. If "
+            "a result describes something as a rumor, leak, or unconfirmed report, say so plainly as part of your "
+            "answer (e.g. 'it's being reported/rumored that...') rather than declining to discuss it at all. "
+            "Do not refuse to answer, and do not add disclaimers about being unable to discuss real people, when "
+            "the question is this kind of everyday, publicly-reported information.
         """]
 
     if context:
@@ -213,11 +200,6 @@ def get_llama_response(
             f"Knowledge Base (only use this if it's actually relevant to the question below):\n{context}"
         )
 
-    # Web search results and page content go last among the system
-    # sections (closest, in reading order, to where history/the question
-    # will follow), since smaller local models tend to weight later
-    # context more heavily - same reasoning as before, just now all
-    # still safely inside the single leading system message.
     if web_context:
         system_sections.append(
             "Web Search Results (live, fetched just now - this is more "
@@ -238,8 +220,6 @@ def get_llama_response(
         }
     ]
 
-    # History follows the single system message, then the user's
-    # question last - a clean, strictly-alternating shape.
     for m in history:
         messages.append({
             "role": m["role"],
@@ -270,20 +250,28 @@ def get_llama_response(
         r = _post(messages)
         r.raise_for_status()
         result = r.json()
-        return result["choices"][0]["message"]["content"].strip()
+        reply = result["choices"][0]["message"]["content"].strip()
+
+        # NEW: log (not silently swallow) apparent model refusals, so
+        # they show up clearly in server logs next to the exact prompt
+        # (when VERONICA_DEBUG_PROMPTS=1) instead of just looking like
+        # an ordinary answer. Doesn't change behavior - purely visibility,
+        # so you can tell "the model declined" apart from "the model
+        # gave a real but wrong/unhelpful answer" at a glance in logs.
+        _REFUSAL_MARKERS = (
+            "i'm sorry, but i can't", "i am sorry but i cant",
+            "i can't assist with that", "i cannot assist with that",
+            "i'm not able to help with that", "as an ai",
+        )
+        if any(m in reply.lower() for m in _REFUSAL_MARKERS):
+            logger.warning(
+                "Local model appears to have REFUSED session=%s question=%r reply=%r",
+                session_id, user_question, reply
+            )
+
+        return reply
 
     except requests.HTTPError as e:
-        # FIX: r.raise_for_status() only raised "400 Client Error: Bad
-        # Request for url: ..." - it never surfaced WHAT the server
-        # actually objected to, which is the one thing needed to fix a
-        # persistent 400. Some local model chat templates (Gemma-family
-        # is the best-known case) reject "role": "system" outright,
-        # which fits exactly what was observed: every single message
-        # failing identically, even the very first message of a brand
-        # new session with no history yet - a shape/ordering bug would
-        # only show up once history existed, not on turn one. So: one
-        # automatic retry, folding the system content into the leading
-        # user message instead of a system role, before giving up.
         body = ""
         try:
             body = e.response.text[:500] if e.response is not None else ""
@@ -299,14 +287,11 @@ def get_llama_response(
             no_system_messages = []
             for i, m in enumerate(messages):
                 if m["role"] == "system":
-                    # Fold into the next message if there is one, else
-                    # send standalone as a user turn.
                     if i + 1 < len(messages):
                         continue
                     no_system_messages.append({"role": "user", "content": m["content"]})
                 else:
                     no_system_messages.append(m)
-            # Prepend all system content onto the first non-system message.
             system_text = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
             if system_text and no_system_messages and no_system_messages[0]["role"] != "system":
                 no_system_messages[0] = {
@@ -336,9 +321,6 @@ def get_llama_response(
         return f"Local model error: {e}"
 
 
-# -------------------------------------------------
-# Function to get Veronica's response based on KB
-# -------------------------------------------------
 from global_setup import DATA
 def handle_stream_query(query, data):
     q = query.lower()
@@ -348,12 +330,10 @@ def handle_stream_query(query, data):
 
     results = []
 
-    # ✅ 1. DIRECT STREAM MATCH (FIXES YOUR BUG)
     for stream in fees:
         if stream.lower() in q:
             return f"{stream} – ₹{fees[stream]}"
 
-    # ✅ 2. CATEGORY MATCH (arts, science, commerce)
     for key, streams in mappings.items():
         if key in q:
             for s in streams:
@@ -362,15 +342,15 @@ def handle_stream_query(query, data):
             return "\n".join(results)
 
     return None
+
+
 def get_veronica_response(
     user_question: str,
     knowledge_base: Dict,
     session_id: str,
     page_content: str = "",
-    web_content: str = ""      # NEW: search results already fetched by
-                                # the client's own ghost browser tab
+    web_content: str = ""
 ) -> str:
-    # quick utility commands
     if user_question.lower() == 'date':
         answer = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}"
         save_message(session_id, "user", user_question)
@@ -383,7 +363,6 @@ def get_veronica_response(
         save_message(session_id, "assistant", answer)
         return answer
 
-    # 🔥 Handle stream/fees BEFORE anything else
     if "fee" in user_question.lower() or "fees" in user_question.lower():
         stream_answer = handle_stream_query(user_question, DATA)
         if stream_answer:
@@ -392,7 +371,6 @@ def get_veronica_response(
             save_message(session_id, "assistant", answer)
             return answer
 
-    # Try FAQ/knowledge base first
     best_match = find_best_match(
         user_question,
         [q.get("question") for q in knowledge_base.get("questions", [])]
@@ -403,11 +381,8 @@ def get_veronica_response(
     else:
         web_context = ""
         if web_content:
-            # The client's browser already did the search — use it as-is,
-            # never call an external search API for this turn.
             web_context = web_content
         elif not page_content and needs_web_search(user_question):
-            # Fallback only: covers any client that never sends web_content.
             try:
                 web_context = build_web_context(user_question)
             except Exception:
@@ -424,10 +399,10 @@ def get_veronica_response(
     save_message(session_id, "assistant", answer)
 
     return answer
-# Main section for testing purposes
+
 if __name__ == "__main__":
     knowledge_base = load_knowledge_base('knowledge_base.json')
-    
+
     while True:
         user_question = input('You: ')
         if user_question.lower() == 'quit':
