@@ -21,40 +21,11 @@ import json
 logging.basicConfig(level=logging.DEBUG)
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------
-# FIX: app.run() used to be called with debug=True and no `threaded`
-# argument at all, which means Flask's development server handled
-# requests ONE AT A TIME on a single thread. Concretely: while a slow
-# summarize/agent request was being processed, every other request -
-# including a completely unrelated chat message from the same or a
-# different user - queued up behind it and got nothing back until the
-# first one finished or timed out. That queueing is exactly what looked
-# like "the agent and chat colliding" / "chat stops responding until
-# the app or server resets". FLASK_DEBUG defaults to false here since
-# debug mode's auto-reloader is a production liability on its own (it
-# runs the app in a child process and can leave stale/duplicate
-# processes behind on a host like Render); set the env var if you want
-# it back for local development.
-# ---------------------------------------------------------------------
 FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-
-# NEW: any single request handler still runs on one thread even with
-# threaded=True - if that handler itself hangs (e.g. Veronica.py calling
-# out to something with no timeout of its own), it still ties up that
-# one thread indefinitely. RESPONSE_TIMEOUT_SECONDS bounds the actual
-# Veronica call so a single stuck request can never hang forever, and
-# gives the person a clear, immediate answer instead of a silent wait.
 RESPONSE_TIMEOUT_SECONDS = int(os.environ.get("RESPONSE_TIMEOUT_SECONDS", "45"))
 _response_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="veronica")
-
-# NEW: hard cap on how much page text a single chat request will ever
-# embed in the LLM prompt, applied even on the "yes, send it now" path -
-# defense in depth on top of the client already capping its own
-# extraction, so a stray huge payload can never balloon token usage or
-# generation time.
 MAX_PAGE_CONTENT_CHARS = int(os.environ.get("MAX_PAGE_CONTENT_CHARS", "4000"))
 
-# Allowed origins (exact matches)
 ALLOWED_ORIGINS = {
     "https://christjuniorcollege.in",
     "https://www.christjuniorcollege.in",
@@ -64,35 +35,24 @@ ALLOWED_ORIGINS = {
     "https://cogniaistudios.com"
 }
 
-# Enable CORS (helps for simple cases; explicit OPTIONS handling below is the key)
 CORS(app, resources={r"/predict": {"origins": list(ALLOWED_ORIGINS)}}, methods=["POST", "OPTIONS"], allow_headers=["Content-Type", "Authorization"])
 
-# Load knowledge base
 knowledge_base = load_knowledge_base('knowledge_base.json')
-# NEW: /save mutates this global from a request handler; now that Flask
-# runs threaded, guard reads/writes so a save mid-request can't hand a
-# half-updated object to a concurrently running /predict call.
 _knowledge_base_lock = threading.Lock()
 
-# Configure the Gemini model from environment variable (do not hardcode keys)
-
-
-# Optional: helper to call Gemini if needed (kept from your code)
-DATABASE_URL = os.environ.get('DATABASE_URL')  # expected to be provided in environment
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 if not DATABASE_URL:
     app.logger.warning('DATABASE_URL environment variable not set. DB logging and export will be disabled.')
 
 
 def get_db_conn():
-    """Return a new psycopg2 connection using DATABASE_URL. Caller should close the connection."""
     if not DATABASE_URL:
         raise RuntimeError('DATABASE_URL not configured')
     return psycopg2.connect(DATABASE_URL, sslmode=os.environ.get('PGSSLMODE', 'prefer'))
 
 
 def init_db():
-    """Create messages table if it does not exist."""
     if not DATABASE_URL:
         return
     try:
@@ -116,7 +76,6 @@ def init_db():
         app.logger.exception('Failed to initialize DB')
 
 
-# helper to insert a message row
 def db_insert_message(session_id, role, message, reply_id=None, url=None, user_agent=None, created_at=None):
     if not DATABASE_URL:
         return
@@ -136,7 +95,6 @@ def db_insert_message(session_id, role, message, reply_id=None, url=None, user_a
         app.logger.exception('db_insert_message failed')
 
 
-# helper to fetch all conversations (ordered by created_at)
 def fetch_all_conversations():
     if not DATABASE_URL:
         return []
@@ -151,10 +109,9 @@ def fetch_all_conversations():
         return []
 
 
-# Initialize DB (create table)
 init_db()
 
-# Optional: helper to call Gemini if needed (kept from your code)
+
 def get_veronica_response_from_knowledge_or_gemini(text):
     resp = get_veronica_response(text, knowledge_base)
     if resp == "Sorry I dont know what you are talking about! ^.^":
@@ -163,14 +120,6 @@ def get_veronica_response_from_knowledge_or_gemini(text):
 
 
 def get_veronica_response_bounded(user_question, kb, session_id, page_content="", web_content=""):
-    """
-    NEW: runs get_veronica_response() on a worker thread with a hard wall
-    clock limit (RESPONSE_TIMEOUT_SECONDS). If it doesn't finish in time,
-    raises FutureTimeoutError and the caller returns a clear, immediate
-    message instead of leaving the request (and the thread handling it)
-    hanging indefinitely - which is what could make the whole chat look
-    stuck until the process was restarted.
-    """
     future = _response_executor.submit(
         get_veronica_response,
         user_question=user_question,
@@ -182,16 +131,14 @@ def get_veronica_response_bounded(user_question, kb, session_id, page_content=""
     return future.result(timeout=RESPONSE_TIMEOUT_SECONDS)
 
 
-# DEBUG: log incoming requests (helps see if preflight reaches Flask)
 @app.before_request
 def log_request():
     app.logger.debug("Incoming %s %s", request.method, request.url)
     app.logger.debug("Headers: %s", dict(request.headers))
 
-# /predict route: explicit OPTIONS + POST handling
+
 @app.route("/predict", methods=["OPTIONS", "POST"], strict_slashes=False)
 def predict():
-    # Preflight: securely respond with CORS headers if origin trusted
     if request.method == "OPTIONS":
         origin = request.headers.get("Origin", "")
         resp = make_response("", 204)
@@ -230,29 +177,23 @@ def predict():
             user_message = request_data.get("message", "").lower()
 
             browser_keywords = [
-                "open",
-                "go to",
-                "navigate",
-                "visit",
-                "click",
-                "scroll",
-                "type",
-                "press",
-                "download",
-                "upload",
-                "reload",
-                "refresh",
-                "back",
-                "forward",
-                "new tab",
-                "close tab",
-                "switch tab",
-                "login",
-                "log in",
-                "sign in"
+                "open", "go to", "navigate", "visit", "click", "scroll", "type",
+                "press", "download", "upload", "reload", "refresh", "back",
+                "forward", "new tab", "close tab", "switch tab", "login",
+                "log in", "sign in"
             ]
 
             is_agent = any(k in user_message for k in browser_keywords)
+
+            # NEW: log the auto-mode routing decision. If a message that
+            # should clearly be a search-needing chat ("check the web",
+            # a factual question) is instead classified as is_agent=True,
+            # it goes to the browser planner instead of chat and will
+            # never hit needs_web_search at all.
+            app.logger.info(
+                "[auto-route] session=%s is_agent=%s message=%r",
+                session_id, is_agent, user_message
+            )
 
             if is_agent:
                 plan = get_agent_plan(
@@ -265,9 +206,6 @@ def predict():
 
             mode = "chat"
 
-        # =====================================================
-        # NOAH AGENT MODE
-        # =====================================================
         if mode == "agent":
             goal = request_data.get("goal", "")
             observation = request_data.get("observation", {})
@@ -280,30 +218,18 @@ def predict():
 
             try:
                 db_insert_message(
-                    session_id,
-                    "agent",
-                    goal,
-                    reply_id=None,
-                    url=url,
-                    user_agent=user_agent
+                    session_id, "agent", goal, reply_id=None, url=url, user_agent=user_agent
                 )
             except Exception:
                 app.logger.exception("Agent logging failed")
 
             plan = get_agent_plan(
-                goal=goal,
-                observation=observation,
-                memory=memory,
-                session_id=session_id
+                goal=goal, observation=observation, memory=memory, session_id=session_id
             )
             try:
                 db_insert_message(
-                    session_id,
-                    "planner",
-                    json.dumps(plan),
-                    reply_id=str(uuid.uuid4())[:12],
-                    url=url,
-                    user_agent=user_agent
+                    session_id, "planner", json.dumps(plan),
+                    reply_id=str(uuid.uuid4())[:12], url=url, user_agent=user_agent
                 )
             except Exception:
                 app.logger.exception("Planner logging failed")
@@ -312,7 +238,6 @@ def predict():
 
         user_text = text.strip().lower()
 
-        # 1) Detect full URL
         match = re.search(r"(https?://[^\s]+)", user_text)
         if match:
             url_match = match.group(0)
@@ -324,7 +249,6 @@ def predict():
                 app.logger.exception('logging url branch failed')
             return jsonify({"answer": f"Opening the link: {url_match}...", "url": url_match}), 200
 
-        # --- CJC MAPPING ---
         cj_base = "https://christjuniorcollege.in/"
         mapping = {
             "institution": ("Open Institution", cj_base + "about-the-institution.php"),
@@ -362,7 +286,6 @@ def predict():
             "managebac": ("Open ManageBac Login", "https://cjc.managebac.com/login")
         }
 
-        # --- FIXED COMMAND DETECTION ---
         words = user_text.split()
         if words and words[0] == "open":
             query = " ".join(words[1:]).strip()
@@ -394,9 +317,20 @@ def predict():
                 app.logger.info("Chat message needs page content but none was sent yet; requesting it from the client.")
                 return jsonify({"needs_page_content": True}), 200
 
-        # NEW: same round-trip shape as needs_page_content above, but for
-        # search - the client's own browser fetches results instead of
-        # this server calling an external search API.
+        # NEW: log exactly what needs_web_search() decided and why, for
+        # every chat turn that reaches this point. This is the one gate
+        # that determines whether the client ever gets asked to search -
+        # if a turn like "check the web" or "who is playing X" logs
+        # needs_search=False here, that confirms the classifier itself
+        # (not the client) is the bug, and exactly which phrasing it's
+        # missing.
+        already_has_web_content = bool(web_content)
+        would_request_search = (not already_has_web_content) and needs_web_search(text)
+        app.logger.info(
+            "[web-search-gate] session=%s already_has_web_content=%s needs_web_search=%s text=%r",
+            session_id, already_has_web_content, would_request_search, text
+        )
+
         if not web_content and needs_web_search(text):
             app.logger.info("Chat message needs a web search; asking the client to search with its own browser.")
             return jsonify({"needs_web_search": True, "search_query": text}), 200
@@ -429,7 +363,7 @@ def predict():
         app.logger.exception("Error in /predict")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
-# Endpoint to export all conversations as CSV
+
 @app.route('/export_conversations', methods=['GET'])
 def export_conversations():
     try:
@@ -437,7 +371,6 @@ def export_conversations():
         if not rows:
             return jsonify({'ok': True, 'file': None, 'message': 'No conversation rows found or DB not configured.'})
 
-        # create CSV in-memory
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(['session_id', 'role', 'message', 'reply_id', 'url', 'user_agent', 'created_at'])
@@ -462,7 +395,6 @@ def export_conversations():
         return jsonify({'ok': False, 'message': 'Export failed'}), 500
 
 
-# Static file endpoints (unchanged)
 @app.route("/widget.js")
 def widget_js():
     return send_from_directory(app.static_folder, 'widget.js')
@@ -514,11 +446,4 @@ def save():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-
-    # FIX: threaded=True is the actual fix for "agent and chat collide" -
-    # without it, Werkzeug's dev server serializes every request onto one
-    # thread, so one slow agent/summarize call blocks all other traffic
-    # until it finishes or times out. debug now defaults off (see
-    # FLASK_DEBUG above); set FLASK_DEBUG=true in the environment for
-    # local development if you want the reloader back.
     app.run(host='0.0.0.0', port=port, debug=FLASK_DEBUG, threaded=True)
