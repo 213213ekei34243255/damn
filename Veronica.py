@@ -370,7 +370,33 @@ def get_veronica_response(
     web_content: str = ""      # NEW: search results already fetched by
                                 # the client's own ghost browser tab
 ) -> str:
-    # ... unchanged date/time/fees/FAQ handling above ...
+    # quick utility commands
+    if user_question.lower() == 'date':
+        answer = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}"
+        save_message(session_id, "user", user_question)
+        save_message(session_id, "assistant", answer)
+        return answer
+
+    if user_question.lower() == 'time':
+        answer = f"The current time is {datetime.now().strftime('%H:%M:%S')}"
+        save_message(session_id, "user", user_question)
+        save_message(session_id, "assistant", answer)
+        return answer
+
+    # 🔥 Handle stream/fees BEFORE anything else
+    if "fee" in user_question.lower() or "fees" in user_question.lower():
+        stream_answer = handle_stream_query(user_question, DATA)
+        if stream_answer:
+            answer = stream_answer
+            save_message(session_id, "user", user_question)
+            save_message(session_id, "assistant", answer)
+            return answer
+
+    # Try FAQ/knowledge base first
+    best_match = find_best_match(
+        user_question,
+        [q.get("question") for q in knowledge_base.get("questions", [])]
+    )
 
     if best_match:
         answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
@@ -381,11 +407,7 @@ def get_veronica_response(
             # never call an external search API for this turn.
             web_context = web_content
         elif not page_content and needs_web_search(user_question):
-            # Fallback path only: covers any older client that never sends
-            # web_content (e.g. app.py's needs_web_search gate wasn't hit
-            # because of some other early-return branch). Keeps behavior
-            # safe rather than silently answering with no web context at
-            # all.
+            # Fallback only: covers any client that never sends web_content.
             try:
                 web_context = build_web_context(user_question)
             except Exception:
@@ -398,59 +420,6 @@ def get_veronica_response(
             page_content=page_content
         )
 
-    save_message(session_id, "user", user_question)
-    save_message(session_id, "assistant", answer)
-
-    return answer
-
-    # Try FAQ/knowledge base first
-    # FIX: user_question is now always the person's actual plain
-    # question/message - page_content (when present) is a separate
-    # parameter, never concatenated into this string. Previously,
-    # whenever a page was open, this ran a fuzzy match against the
-    # ENTIRE extracted page text glued onto the question, which could
-    # never sensibly match a short FAQ entry and only wasted a
-    # difflib pass over a huge string every time.
-    best_match = find_best_match(
-        user_question,
-        [q.get("question") for q in knowledge_base.get("questions", [])]
-    )
-
-    if best_match:
-        answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
-    else:
-        # FIX: web search is now skipped entirely whenever page_content
-        # is present. If the user already has a page open and Noah
-        # already has its text, there's never a legitimate reason to
-        # ALSO hit an external search engine for the same request -
-        # doing so previously meant needs_web_search()/build_web_context()
-        # received the *entire page content glued onto the question* as
-        # their input, and DuckDuckGo ended up being asked to "search"
-        # for a multi-thousand-character Wikipedia article, which just
-        # timed out on every attempt and added pure latency to every
-        # single summarize/follow-up request for no benefit at all.
-        #
-        # When there's no page content (a normal chat message), the
-        # existing behavior is unchanged: only search the web when the
-        # question actually looks like it needs fresh/current info.
-        web_context = ""
-        if not page_content and needs_web_search(user_question):
-            try:
-                web_context = build_web_context(user_question)
-            except Exception:
-                # Never let a search failure break the chat - just fall
-                # back to answering without web context instead of
-                # erroring out.
-                web_context = ""
-
-        answer = get_llama_response(
-            user_question,
-            session_id,
-            web_context=web_context,
-            page_content=page_content
-        )
-
-    # Save this turn in Redis so future messages have context
     save_message(session_id, "user", user_question)
     save_message(session_id, "assistant", answer)
 
