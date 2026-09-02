@@ -163,6 +163,14 @@ def get_veronica_response_from_knowledge_or_gemini(text):
 
 
 def get_veronica_response_bounded(user_question, kb, session_id, page_content="", web_content=""):
+    """
+    NEW: runs get_veronica_response() on a worker thread with a hard wall
+    clock limit (RESPONSE_TIMEOUT_SECONDS). If it doesn't finish in time,
+    raises FutureTimeoutError and the caller returns a clear, immediate
+    message instead of leaving the request (and the thread handling it)
+    hanging indefinitely - which is what could make the whole chat look
+    stuck until the process was restarted.
+    """
     future = _response_executor.submit(
         get_veronica_response,
         user_question=user_question,
@@ -199,41 +207,33 @@ def predict():
         print("================================")
         print("REQUEST DATA:")
         print(request_data)
-    
+
         mode = request_data.get("mode", "chat")
         message = request_data.get("message", "")
-    
+
         print("MODE =", mode)
         print("================================")
         text = request_data.get("message", "")
         goal = request_data.get("goal", "")
-        # session id may be sent by widget (optional)
         session_id = request_data.get('session_id') or request_data.get('sid') or 'unknown'
         url = request_data.get('url')
         page_content = request_data.get('page_content', '')
         web_content = request_data.get('web_content', '')
-        
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
 
         if mode == "chat" and not text:
-
             return jsonify({
-        
                 "answer": "Invalid input"
-        
             }), 400
-        if mode == "auto":
 
+        if mode == "auto":
             user_message = request_data.get("message", "").lower()
-        
+
             browser_keywords = [
-        
                 "open",
                 "go to",
                 "navigate",
                 "visit",
-                "search",
-                "find",
                 "click",
                 "scroll",
                 "type",
@@ -250,49 +250,35 @@ def predict():
                 "login",
                 "log in",
                 "sign in"
-        
             ]
-        
+
             is_agent = any(k in user_message for k in browser_keywords)
-        
+
             if is_agent:
-        
                 plan = get_agent_plan(
-        
                     goal=request_data.get("message", ""),
-        
                     observation=request_data.get("observation", {}),
-        
                     memory=request_data.get("memory", {}),
-        
                     session_id=request_data.get("session_id", "default")
-        
                 )
-        
                 return jsonify(plan)
-        
+
             mode = "chat"
+
         # =====================================================
-# NOAH AGENT MODE
-# =====================================================
-
+        # NOAH AGENT MODE
+        # =====================================================
         if mode == "agent":
-        
             goal = request_data.get("goal", "")
-        
             observation = request_data.get("observation", {})
-        
             memory = request_data.get("memory", {})
-        
-            if not goal:
-        
-                return jsonify({
-        
-                    "error": "Missing goal."
-        
-                }), 400
-            try:
 
+            if not goal:
+                return jsonify({
+                    "error": "Missing goal."
+                }), 400
+
+            try:
                 db_insert_message(
                     session_id,
                     "agent",
@@ -301,24 +287,16 @@ def predict():
                     url=url,
                     user_agent=user_agent
                 )
-            
             except Exception:
-            
                 app.logger.exception("Agent logging failed")
-        
+
             plan = get_agent_plan(
-        
                 goal=goal,
-        
                 observation=observation,
-        
                 memory=memory,
-        
                 session_id=session_id
-        
             )
             try:
-
                 db_insert_message(
                     session_id,
                     "planner",
@@ -327,11 +305,9 @@ def predict():
                     url=url,
                     user_agent=user_agent
                 )
-            
             except Exception:
-            
                 app.logger.exception("Planner logging failed")
-        
+
             return jsonify(plan), 200
 
         user_text = text.strip().lower()
@@ -340,10 +316,8 @@ def predict():
         match = re.search(r"(https?://[^\s]+)", user_text)
         if match:
             url_match = match.group(0)
-            # log user message and bot reply indicating opening the link
             try:
                 db_insert_message(session_id, 'user', text, reply_id=None, url=url or url_match, user_agent=user_agent)
-                # create a bot reply id
                 bot_reply_id = str(uuid.uuid4())[:12]
                 db_insert_message(session_id, 'bot', f"Opening the link: {url_match}...", reply_id=bot_reply_id, url=url or url_match, user_agent=user_agent)
             except Exception:
@@ -395,17 +369,14 @@ def predict():
 
             for key, (label, url_map) in mapping.items():
                 if all(word in query for word in key.split()):
-                    # log user and bot
                     try:
                         db_insert_message(session_id, 'user', text, reply_id=None, url=url, user_agent=user_agent)
                         bot_reply_id = str(uuid.uuid4())[:12]
                         db_insert_message(session_id, 'bot', f"{label}...", reply_id=bot_reply_id, url=url_map, user_agent=user_agent)
                     except Exception:
                         app.logger.exception('logging mapping branch failed')
-
                     return jsonify({"answer": f"{label}...", "url": url_map}), 200
 
-            # If no match, DO NOTHING — NO GOOGLE SEARCH
             try:
                 db_insert_message(session_id, 'user', text, reply_id=None, url=url, user_agent=user_agent)
                 bot_reply_id = str(uuid.uuid4())[:12]
@@ -415,39 +386,7 @@ def predict():
 
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
-        # ---------------------------------------------------------------
-        # FIX: this used to glue page_content directly into a single
-        # "augmented_question" string before ever calling
-        # get_veronica_response() - which meant Veronica.py had no way
-        # to tell "the user's actual question" apart from "the user's
-        # question plus an entire webpage of text". That combined blob
-        # got used as the input to the FAQ fuzzy-matcher AND to the
-        # web-search-necessity check, and when a big page was open,
-        # DuckDuckGo ended up being asked to search for the literal text
-        # of the whole page - which is exactly what was timing out and
-        # slowing down every single summarize/follow-up request.
-        #
-        # New behavior - page content is fetched and used ON DEMAND
-        # ONLY, and kept as its own separate value the whole way through
-        # (never concatenated into the question string):
-        #   1. If the client already sent page_content (it does this
-        #      only when IT already knows content is needed - e.g. the
-        #      dedicated Summarize flow - or when it's resending after
-        #      we asked for it below), pass it straight through to
-        #      Veronica as its own parameter, truncated to a safe cap
-        #      regardless of how much was sent.
-        #   2. Otherwise, ask needs_page_content() - a real JSON/tool-
-        #      calling decision (see agent.py) - whether THIS message
-        #      actually requires the page's text to answer well.
-        #        - If no: answer normally, with no page content at all.
-        #        - If yes: don't call the LLM with a guess at content -
-        #          tell the client we need it and stop here. The client
-        #          (NoahAgentService / ChatService) then fetches the
-        #          page text and resends exactly once with page_content
-        #          attached, landing back in branch (1) above. No loops,
-        #          no repeated back-and-forth beyond that one round trip.
-        # ---------------------------------------------------------------
-         if page_content:
+        if page_content:
             if len(page_content) > MAX_PAGE_CONTENT_CHARS:
                 page_content = page_content[:MAX_PAGE_CONTENT_CHARS] + "\n...[truncated]"
         else:
@@ -456,9 +395,8 @@ def predict():
                 return jsonify({"needs_page_content": True}), 200
 
         # NEW: same round-trip shape as needs_page_content above, but for
-        # search. If the client hasn't attached web_content yet, tell it
-        # to go fetch some with its own browser (the ghost WKWebView tab)
-        # instead of this server calling Serper/Brave/DuckDuckGo itself.
+        # search - the client's own browser fetches results instead of
+        # this server calling an external search API.
         if not web_content and needs_web_search(text):
             app.logger.info("Chat message needs a web search; asking the client to search with its own browser.")
             return jsonify({"needs_web_search": True, "search_query": text}), 200
@@ -478,7 +416,6 @@ def predict():
             app.logger.warning(f"get_veronica_response timed out after {RESPONSE_TIMEOUT_SECONDS}s for session {session_id}")
             response = "Sorry, that's taking longer than expected to think through — please try again in a moment."
 
-        # log user message and bot response to DB (non-blocking)
         try:
             db_insert_message(session_id, 'user', text, reply_id=None, url=url, user_agent=user_agent)
             bot_reply_id = str(uuid.uuid4())[:12]
@@ -491,8 +428,6 @@ def predict():
     except Exception:
         app.logger.exception("Error in /predict")
         return jsonify({"error": "An unexpected error occurred."}), 500
-
-
 
 # Endpoint to export all conversations as CSV
 @app.route('/export_conversations', methods=['GET'])
