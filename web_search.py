@@ -118,6 +118,15 @@ WEB_SEARCH_TRIGGERS = [
     "election", "ceo of", "president of", "prime minister of",
     "is still", "is it still", "does still exist", "still around",
     "just announced", "breaking", "live", "schedule for", "upcoming",
+    # NEW: casting / entertainment-lookup phrasing. These are exactly the
+    # kind of thing a static LLM's training data is most likely to be
+    # stale or wrong about (casting news changes constantly, right up
+    # until release), so treat them the same as the other "ask the real
+    # world" triggers above rather than letting them fall through to
+    # "the model probably already knows this."
+    "who is playing", "who plays the role", "who plays", "who is starring",
+    "who stars", "who is cast as", "cast of", "starring in", "voice of",
+    "actor who plays", "actress who plays",
 ]
 
 # Generic-knowledge / conceptual-question phrasing - things the LLM
@@ -139,7 +148,9 @@ def needs_web_search(question: str) -> bool:
 
     Order of checks:
       1. Chit-chat / greetings -> never search.
-      2. Explicit "search for X" style requests -> always search.
+      2. Explicit "search for X" style requests (named phrases, or the
+         generic "check/search/look/browse/google ... web/internet/
+         online" pattern) -> always search.
       3. Time-sensitive/current-event trigger words, or a recent year
          (2024-2029) -> search.
       4. Generic "explain/what is/how does" conceptual phrasing with no
@@ -157,7 +168,14 @@ def needs_web_search(question: str) -> bool:
     if _CHITCHAT_PATTERN.match(q):
         return False
 
-    if _EXPLICIT_SEARCH_PATTERN.search(q):
+    # FIX: _EXPLICIT_SEARCH_GENERIC_PATTERN was defined above (and its
+    # docstring/comment explicitly claims it covers "check the web"
+    # style phrasing) but was never actually referenced here - only
+    # _EXPLICIT_SEARCH_PATTERN (which only matches "check online", not
+    # "check the web") was checked. That's exactly why an explicit
+    # "check the web" request was falling through to the default
+    # `return False` below instead of triggering a search.
+    if _EXPLICIT_SEARCH_PATTERN.search(q) or _EXPLICIT_SEARCH_GENERIC_PATTERN.search(q):
         return True
 
     if any(trigger in q for trigger in WEB_SEARCH_TRIGGERS):
