@@ -366,29 +366,42 @@ def get_veronica_response(
     user_question: str,
     knowledge_base: Dict,
     session_id: str,
-    page_content: str = ""
+    page_content: str = "",
+    web_content: str = ""      # NEW: search results already fetched by
+                                # the client's own ghost browser tab
 ) -> str:
-    # quick utility commands
-    if user_question.lower() == 'date':
-        answer = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}"
-        save_message(session_id, "user", user_question)
-        save_message(session_id, "assistant", answer)
-        return answer
+    # ... unchanged date/time/fees/FAQ handling above ...
 
-    if user_question.lower() == 'time':
-        answer = f"The current time is {datetime.now().strftime('%H:%M:%S')}"
-        save_message(session_id, "user", user_question)
-        save_message(session_id, "assistant", answer)
-        return answer
+    if best_match:
+        answer = get_answer_for_question(best_match, knowledge_base) or "No answer found."
+    else:
+        web_context = ""
+        if web_content:
+            # The client's browser already did the search — use it as-is,
+            # never call an external search API for this turn.
+            web_context = web_content
+        elif not page_content and needs_web_search(user_question):
+            # Fallback path only: covers any older client that never sends
+            # web_content (e.g. app.py's needs_web_search gate wasn't hit
+            # because of some other early-return branch). Keeps behavior
+            # safe rather than silently answering with no web context at
+            # all.
+            try:
+                web_context = build_web_context(user_question)
+            except Exception:
+                web_context = ""
 
-    # 🔥 NEW: Handle stream/fees BEFORE anything else
-    if "fee" in user_question.lower() or "fees" in user_question.lower():
-        stream_answer = handle_stream_query(user_question, DATA)
-        if stream_answer:
-            answer = stream_answer
-            save_message(session_id, "user", user_question)
-            save_message(session_id, "assistant", answer)
-            return answer
+        answer = get_llama_response(
+            user_question,
+            session_id,
+            web_context=web_context,
+            page_content=page_content
+        )
+
+    save_message(session_id, "user", user_question)
+    save_message(session_id, "assistant", answer)
+
+    return answer
 
     # Try FAQ/knowledge base first
     # FIX: user_question is now always the person's actual plain
