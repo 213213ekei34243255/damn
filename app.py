@@ -263,12 +263,21 @@ def predict():
             )
 
             if is_agent:
+                # This "auto" branch only fires on the client's FIRST message
+                # for a goal, before any agent loop is running - every
+                # continuation of that same task comes back as mode="agent"
+                # below. So this is the one place that reliably marks the
+                # start of a genuinely new task, and is where stale memory
+                # (extractedResults, currentTask, etc.) from whatever the
+                # user asked for previously must be dropped instead of
+                # leaking into this new goal's first planning cycle.
                 plan = get_agent_plan(
                     goal=request_data.get("message", ""),
                     observation=request_data.get("observation", {}),
                     memory=request_data.get("memory", {}),
                     session_id=request_data.get("session_id", "default"),
-                    tier=tier
+                    tier=tier,
+                    fresh_goal=True
                 )
                 return jsonify(plan)
 
