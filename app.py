@@ -239,6 +239,7 @@ def predict():
             ]
 
             is_agent = any(k in user_message for k in browser_keywords)
+            tier = request_data.get('tier', 'free')
 
             # NEW: log the auto-mode routing decision. If a message that
             # should clearly be a search-needing chat ("check the web",
@@ -255,7 +256,8 @@ def predict():
                     goal=request_data.get("message", ""),
                     observation=request_data.get("observation", {}),
                     memory=request_data.get("memory", {}),
-                    session_id=request_data.get("session_id", "default")
+                    session_id=request_data.get("session_id", "default"),
+                    tier=tier
                 )
                 return jsonify(plan)
 
@@ -279,7 +281,7 @@ def predict():
                 app.logger.exception("Agent logging failed")
 
             plan = get_agent_plan(
-                goal=goal, observation=observation, memory=memory, session_id=session_id
+                goal=goal, observation=observation, memory=memory, session_id=session_id , tier=tier
             )
             try:
                 db_insert_message(
