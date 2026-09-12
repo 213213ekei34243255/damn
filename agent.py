@@ -370,6 +370,17 @@ CRITICAL RULES:
    specific website, prefer "navigate" over trying to find a search
    box on the current page.
 
+4. When the goal involves finding the cheapest/best-priced item, use
+   the "prices" list in CURRENT BROWSER STATE — each entry is a real
+   price found on the page with nearby product context and a selector.
+   Compare "prices" entries directly rather than guessing from button
+   or link labels. If you need to confirm exactly what a price belongs
+   to, or need to compare items across more than one page, use an
+   "extract" action on that item's selector — whatever it returns comes
+   back to you next turn under "extractedResults" in MEMORY, so you can
+   keep comparing things you've already looked at without needing them
+   all on screen at the same time.
+
 Supported action types are:
 
 navigate
@@ -438,15 +449,25 @@ class AgentPlanner:
             goal: str,
             observation: Dict,
             memory: Dict,
-            resolved_url: Optional[str] = None
+            resolved_url: Optional[str] = None,
+            max_actions: int = 5,
+            item_limit: int = 20,
+            text_limit: int = 4000,
     ):
 
         """
         Build the reasoning prompt for Noah.
+
+        max_actions/item_limit/text_limit are tier-driven (see
+        AgentPlanner.plan) - Premium Plus/Ultra get a higher action cap
+        per cycle and a richer view of the page (more buttons/links/
+        prices, more text), since a task like "find the cheapest X"
+        needs to actually see most of a results page, not just the
+        first handful that fit in a small budget.
         """
 
         observation_json = json.dumps(
-            self.summarize_observation(observation),
+            self.summarize_observation(observation, item_limit=item_limit, text_limit=text_limit),
             indent=2,
             ensure_ascii=False
         )
@@ -496,6 +517,10 @@ class AgentPlanner:
 
     {observation_json}
 
+    Note: "prices" above lists short price-looking text found on the
+    page (e.g. "₹599"), each with a "context" field showing nearby
+    product text and a "selector" you can pass to an "extract" action
+    to read more from that exact element. See CRITICAL RULE 4.
 
     =========================
     MEMORY
@@ -535,7 +560,7 @@ class AgentPlanner:
 
     Keep plans short.
 
-    Do NOT generate more than 5 actions.
+    Do NOT generate more than {max_actions} actions.
 
     """
 
@@ -561,13 +586,21 @@ class AgentPlanner:
 
     def summarize_observation(
             self,
-            observation: Dict
+            observation: Dict,
+            item_limit: int = 20,
+            text_limit: int = 4000,
     ):
 
         """
         Reduce unnecessary HTML before sending
         to the LLM. buttons/inputs/links/text live under
         observation["page"], not at the top level.
+
+        Also passes through "prices" (see NoahPageObserver.swift's
+        extractionJS on the client) — a generic scan for price-looking
+        text on the page. This is what actually makes "find the
+        cheapest X" answerable, instead of hoping a price happens to
+        sit inside a button/link's own truncated label.
         """
 
         page = observation.get("page", {}) or {}
@@ -587,17 +620,26 @@ class AgentPlanner:
         def _slim_link(l):
             return {"text": (l.get("text") or "")[:80], "href": l.get("href", ""), "selector": l.get("selector", "")}
 
+        def _slim_price(p):
+            return {
+                "text": (p.get("text") or "")[:40],
+                "context": (p.get("context") or "")[:80],
+                "selector": p.get("selector", ""),
+            }
+
         buttons = [b for b in page.get("buttons", []) if b.get("visible") is not False]
         inputs = page.get("inputs", [])
         links = [l for l in page.get("links", []) if l.get("visible") is not False]
+        prices = page.get("prices", [])
 
         summary = {
             "title": browser.get("title") or observation.get("title"),
             "url": browser.get("url") or observation.get("url"),
-            "buttons": [_slim_button(b) for b in buttons[:20]],
-            "inputs": [_slim_input(i) for i in inputs[:20]],
-            "links": [_slim_link(l) for l in links[:20]],
-            "text": (page.get("text") or observation.get("text") or "")[:4000],
+            "buttons": [_slim_button(b) for b in buttons[:item_limit]],
+            "inputs": [_slim_input(i) for i in inputs[:item_limit]],
+            "links": [_slim_link(l) for l in links[:item_limit]],
+            "prices": [_slim_price(p) for p in prices[:item_limit]],
+            "text": (page.get("text") or observation.get("text") or "")[:text_limit],
         }
 
         return summary
@@ -613,6 +655,11 @@ class AgentPlanner:
         actions - and drops everything else (cookies, full page/browser
         snapshots already covered by summarize_observation, unbounded
         history, etc.) that was previously dumped in raw.
+
+        Also carries "extractedResults" forward - text pulled back by
+        "extract" actions across this task's earlier steps (see
+        NoahAgentService.runGoal on the client), trimmed so it can't
+        grow unbounded over a long multi-step task.
         """
         if not isinstance(memory, dict):
             return {}
@@ -631,6 +678,9 @@ class AgentPlanner:
 
         task = memory.get("task") or {}
 
+        extracted = memory.get("extractedResults") or []
+        slim_extracted = [str(e)[:300] for e in extracted[-10:]]
+
         return {
             "goal": (memory.get("goal") or {}).get("text"),
             "task": {
@@ -639,6 +689,7 @@ class AgentPlanner:
                 "pending": (task.get("pending") or [])[:5],
             },
             "recentActions": slim_actions,
+            "extractedResults": slim_extracted,
             "lastResponse": (memory.get("llmContext") or {}).get("lastResponse", ""),
         }
 
@@ -699,7 +750,7 @@ class AgentPlanner:
         )
         return (response.text or "").strip()
 
-    def call_llm(self, messages: List[Dict]):
+    def call_llm(self, messages: List[Dict], prefer_gemini: bool = False):
         """
         Try the local LLM first (fast-fail on connect/read timeout), and
         automatically fall back to Gemini if it fails and a fallback is
@@ -708,7 +759,19 @@ class AgentPlanner:
         on, an unreachable/slow local server now fails within
         LLAMA_CONNECT_TIMEOUT_S + LLAMA_READ_TIMEOUT_S seconds and hands
         off immediately.
+
+        NEW: prefer_gemini (Premium Plus/Ultra, set by plan()) tries
+        Gemini FIRST instead of last - it reasons better on multi-step
+        comparison tasks ("find the cheapest X") than the small local
+        model - and only falls back to local if Gemini itself fails or
+        isn't configured. Free/Premium behavior is unchanged.
         """
+        if prefer_gemini and _gemini_model:
+            try:
+                return self._call_gemini(messages)
+            except Exception as e:
+                logger.warning(f"Preferred Gemini call failed ({e}); falling back to local.")
+
         try:
             return self._call_local_llm(messages)
         except (requests.ConnectionError, requests.Timeout) as e:
@@ -772,7 +835,8 @@ class AgentPlanner:
 
     def generate_plan(
             self,
-            messages
+            messages,
+            prefer_gemini: bool = False,
     ):
         """
         FIX: previously retried up to 3 times with NO distinction between
@@ -791,7 +855,7 @@ class AgentPlanner:
 
         while parse_attempts < max_parse_retries:
             try:
-                text = self.call_llm(messages)
+                text = self.call_llm(messages, prefer_gemini=prefer_gemini)
             except Exception as e:
                 # Both the local model and the Gemini fallback (if any)
                 # failed. No amount of retrying will fix an unreachable
@@ -896,7 +960,8 @@ class AgentPlanner:
             goal: str,
             observation: Dict,
             memory: Dict,
-            session_id: str = "default"
+            session_id: str = "default",
+            tier: str = "free",
     ):
 
         logger.info("====================================")
@@ -904,6 +969,18 @@ class AgentPlanner:
         logger.info("====================================")
 
         logger.info(f"Goal: {goal}")
+        logger.info(f"Tier: {tier}")
+
+        # Premium Plus / Ultra Premium Plus get: Gemini preferred over
+        # the local model (better multi-step comparison reasoning), more
+        # actions allowed per planning cycle, and a richer view of the
+        # page (more buttons/links/prices, more raw text). Matched to
+        # the same tier boundary the iOS client already uses for its own
+        # "extensive features" gate, so this stays consistent end to end.
+        is_advanced = tier in ("premiumPlus", "ultraPremiumPlus")
+        max_actions = 12 if is_advanced else 5
+        item_limit = 40 if is_advanced else 20
+        text_limit = 8000 if is_advanced else 4000
 
         # Merge runtime memory with saved session memory
         merged_memory = self.merge_memory(
@@ -937,11 +1014,14 @@ class AgentPlanner:
             goal,
             observation,
             merged_memory,
-            resolved_url=resolved_url
+            resolved_url=resolved_url,
+            max_actions=max_actions,
+            item_limit=item_limit,
+            text_limit=text_limit,
         )
 
         # Ask the model
-        plan = self.generate_plan(messages)
+        plan = self.generate_plan(messages, prefer_gemini=is_advanced)
 
         # Guarantee the navigate action uses the verified URL, if we have one
         plan = self.apply_resolved_navigation(plan, resolved_url)
@@ -959,7 +1039,8 @@ def get_agent_plan(
         goal: str,
         observation: Dict,
         memory: Dict,
-        session_id: str = "default"
+        session_id: str = "default",
+        tier: str = "free",
 ):
 
     return planner.plan(
@@ -970,6 +1051,8 @@ def get_agent_plan(
 
         memory=memory,
 
-        session_id=session_id
+        session_id=session_id,
+
+        tier=tier,
 
     )
