@@ -222,6 +222,18 @@ def predict():
         page_content = request_data.get('page_content', '')
         web_content = request_data.get('web_content', '')
         user_agent = request_data.get('user_agent') or request.headers.get('User-Agent')
+        # FIX: must be extracted here, unconditionally, for EVERY request -
+        # not inside the `mode == "auto"` branch. Once a client-side agent
+        # loop has real actions in flight, it sends mode="agent" directly
+        # on every follow-up call, skipping the "auto" branch entirely. If
+        # `tier` were only assigned inside that branch, Python still treats
+        # it as a local name for the whole function (since it's assigned
+        # SOMEWHERE in it) - so any request that goes straight to the
+        # `mode == "agent"` branch below hits `tier=tier` before `tier` was
+        # ever set for THIS call, raising UnboundLocalError and crashing
+        # the request with a 500. That 500 is exactly what breaks an
+        # in-progress agent task on its very next step.
+        tier = request_data.get('tier', 'free')
 
         if mode == "chat" and not text:
             return jsonify({
@@ -239,7 +251,6 @@ def predict():
             ]
 
             is_agent = any(k in user_message for k in browser_keywords)
-            tier = request_data.get('tier', 'free')
 
             # NEW: log the auto-mode routing decision. If a message that
             # should clearly be a search-needing chat ("check the web",
@@ -281,7 +292,7 @@ def predict():
                 app.logger.exception("Agent logging failed")
 
             plan = get_agent_plan(
-                goal=goal, observation=observation, memory=memory, session_id=session_id , tier=tier
+                goal=goal, observation=observation, memory=memory, session_id=session_id, tier=tier
             )
             try:
                 db_insert_message(
