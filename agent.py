@@ -752,19 +752,17 @@ class AgentPlanner:
 
     def call_llm(self, messages: List[Dict], prefer_gemini: bool = False):
         """
-        Try the local LLM first (fast-fail on connect/read timeout), and
-        automatically fall back to Gemini if it fails and a fallback is
-        configured. This is what actually fixes "plan timed out": instead
-        of hanging for up to 120s per attempt with nothing to fall back
-        on, an unreachable/slow local server now fails within
-        LLAMA_CONNECT_TIMEOUT_S + LLAMA_READ_TIMEOUT_S seconds and hands
-        off immediately.
-
-        NEW: prefer_gemini (Premium Plus/Ultra, set by plan()) tries
-        Gemini FIRST instead of last - it reasons better on multi-step
-        comparison tasks ("find the cheapest X") than the small local
-        model - and only falls back to local if Gemini itself fails or
-        isn't configured. Free/Premium behavior is unchanged.
+        Local LLM first, always - Gemini has turned out to be
+        unreliable enough in practice that trying it first for
+        Premium Plus/Ultra just added latency (wait for Gemini to fail,
+        THEN fall back to local) instead of better answers. Reverted to
+        local-first for every tier; Gemini stays as the last-resort
+        fallback if the local model is unreachable/erroring, same as
+        before this was tried. `prefer_gemini` is kept as a parameter
+        (harmless, currently always False from plan()) rather than
+        removed outright, in case Gemini's reliability improves later
+        and it's worth revisiting - no other code needs to change to
+        flip it back on.
         """
         if prefer_gemini and _gemini_model:
             try:
@@ -971,12 +969,15 @@ class AgentPlanner:
         logger.info(f"Goal: {goal}")
         logger.info(f"Tier: {tier}")
 
-        # Premium Plus / Ultra Premium Plus get: Gemini preferred over
-        # the local model (better multi-step comparison reasoning), more
-        # actions allowed per planning cycle, and a richer view of the
-        # page (more buttons/links/prices, more raw text). Matched to
-        # the same tier boundary the iOS client already uses for its own
-        # "extensive features" gate, so this stays consistent end to end.
+        # Premium Plus / Ultra Premium Plus get: more actions allowed per
+        # planning cycle, and a richer view of the page (more buttons/
+        # links/prices, more raw text) - matched to the same tier
+        # boundary the iOS client already uses for its own "extensive
+        # features" gate. NOT a Gemini preference - that was tried and
+        # reverted (see call_llm) since Gemini has proven unreliable
+        # enough here that preferring it first just added latency
+        # instead of better answers. Every tier runs on the local model
+        # by default; only the amount of context/actions it gets differs.
         is_advanced = tier in ("premiumPlus", "ultraPremiumPlus")
         max_actions = 12 if is_advanced else 5
         item_limit = 40 if is_advanced else 20
@@ -1020,8 +1021,8 @@ class AgentPlanner:
             text_limit=text_limit,
         )
 
-        # Ask the model
-        plan = self.generate_plan(messages, prefer_gemini=is_advanced)
+        # Ask the model - local-first for every tier (see call_llm).
+        plan = self.generate_plan(messages)
 
         # Guarantee the navigate action uses the verified URL, if we have one
         plan = self.apply_resolved_navigation(plan, resolved_url)
