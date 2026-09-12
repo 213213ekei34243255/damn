@@ -56,7 +56,13 @@ CLASSIFIER_CONNECT_TIMEOUT_S = float(os.getenv("CLASSIFIER_CONNECT_TIMEOUT_S", "
 CLASSIFIER_READ_TIMEOUT_S = float(os.getenv("CLASSIFIER_READ_TIMEOUT_S", "8"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# "gemini-1.5-flash" was retired and now 404s on generateContent for every
+# call (confirmed in prod logs: "models/gemini-1.5-flash is not found for
+# API version v1beta"). That means the fallback path was never actually
+# working - any time the local model timed out, the request just failed
+# outright instead of degrading to Gemini. gemini-2.0-flash is the current
+# equivalent still served on v1beta.
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 _gemini_model = None
 if GEMINI_API_KEY:
@@ -444,6 +450,17 @@ class AgentPlanner:
         with self._memory_lock:
             return self.session_memory.get(session_id, {})
 
+    def forget(self,
+               session_id: str):
+        # session_id doesn't change between unrelated goals in the same app
+        # session (e.g. "find a mouse on Amazon" followed later by "take me
+        # to Flipkart and open shirt"), so without this, merge_memory()'s
+        # merged.update(saved) carries stale extractedResults/task state
+        # from the finished task into the new one's first planning cycle.
+        # Called with fresh_goal=True only where a NEW task actually starts.
+        with self._memory_lock:
+            self.session_memory.pop(session_id, None)
+
     def build_prompt(
             self,
             goal: str,
@@ -618,7 +635,13 @@ class AgentPlanner:
             }
 
         def _slim_link(l):
-            return {"text": (l.get("text") or "")[:80], "href": l.get("href", ""), "selector": l.get("selector", "")}
+            # Real-world hrefs (Flipkart/Amazon nav links especially) often
+            # carry a base64-encoded tracking/ctx query string hundreds of
+            # chars long that adds nothing useful for the model but massively
+            # inflates the prompt - e.g. a 20-link page can add 10k+ chars of
+            # pure tracking junk, which is very likely why the local 1.5B
+            # model timed out planning on Flipkart's homepage. Truncate hard.
+            return {"text": (l.get("text") or "")[:80], "href": (l.get("href") or "")[:120], "selector": l.get("selector", "")}
 
         def _slim_price(p):
             return {
@@ -960,6 +983,7 @@ class AgentPlanner:
             memory: Dict,
             session_id: str = "default",
             tier: str = "free",
+            fresh_goal: bool = False,
     ):
 
         logger.info("====================================")
@@ -968,6 +992,16 @@ class AgentPlanner:
 
         logger.info(f"Goal: {goal}")
         logger.info(f"Tier: {tier}")
+
+        # A brand-new task (not a continuation of one already in flight)
+        # must not inherit the previous task's saved memory - otherwise
+        # extractedResults/currentTask from a just-finished Amazon search
+        # can leak into the very first planning cycle of an unrelated
+        # Flipkart goal. Only the "auto" + is_agent branch in app.py (the
+        # actual start of a new task) passes fresh_goal=True; continuation
+        # calls (mode == "agent") default to False and keep in-task memory.
+        if fresh_goal:
+            self.forget(session_id)
 
         # Premium Plus / Ultra Premium Plus get: more actions allowed per
         # planning cycle, and a richer view of the page (more buttons/
@@ -1042,6 +1076,7 @@ def get_agent_plan(
         memory: Dict,
         session_id: str = "default",
         tier: str = "free",
+        fresh_goal: bool = False,
 ):
 
     return planner.plan(
@@ -1053,6 +1088,8 @@ def get_agent_plan(
         memory=memory,
 
         session_id=session_id,
+
+        fresh_goal=fresh_goal,
 
         tier=tier,
 
