@@ -5,7 +5,7 @@ import os
 from agent import get_agent_plan, needs_page_content
 from media_source_finder import analyze_image as media_source_analyze_image
 from media_source_finder import generate_caption as media_source_generate_caption
-from media_source_finder import analyze_video_candidates as media_source_analyze_video
+from media_source_finder import analyze_video as media_source_analyze_video
 import google.generativeai as genai
 import re
 import logging
@@ -539,27 +539,45 @@ def media_source_image():
 @app.route("/media-source/video", methods=["POST"])
 def media_source_video():
     """
-    Video-mode Media Source Finder (Phase 2). JSON body: `ocr_text`
+    Video-mode Media Source Finder (Phase 2). Multipart form: `ocr_text`
     (aggregated OCR across the client's scene-change-detected keyframes,
     or an HF caption when no keyframe had visible text), `candidates`
-    (a JSON array of {"url", "title", "snippet"} from the client's
-    GoogleSearchService.searchWeb() call - a plain web search for pages,
-    not an image search). Text/keyword-only ranking - see
-    analyze_video_candidates()'s docstring for why there's no visual
-    comparison step here, unlike Image mode.
+    (a JSON string array of {"url", "title", "snippet"} from the
+    client's GoogleSearchService.searchWeb() call - a plain web search
+    for pages, used as the text-only fallback), and up to a few
+    `keyframe_0`, `keyframe_1`, ... JPEG files - representative
+    keyframes sent so analyze_video() can run real Google Web Detection
+    (reverse-image search) on them when GOOGLE_VISION_API_KEY is
+    configured. See analyze_video()'s docstring for how it aggregates
+    matches across keyframes, and analyze_video_candidates()'s for the
+    text-only fallback when Vision isn't available or finds nothing.
     """
     try:
-        data = request.get_json(silent=True) or {}
-        ocr_text = data.get("ocr_text", "")
-        candidates = data.get("candidates", [])
-        if not isinstance(candidates, list):
-            candidates = []
+        ocr_text = request.form.get("ocr_text", "")
+
+        candidates = []
+        candidates_raw = request.form.get("candidates", "[]")
+        try:
+            parsed = json.loads(candidates_raw)
+            if isinstance(parsed, list):
+                candidates = parsed
+        except json.JSONDecodeError:
+            app.logger.warning("media-source/video: could not parse candidates JSON")
+
+        keyframe_images = []
+        index = 0
+        while True:
+            keyframe_file = request.files.get(f"keyframe_{index}")
+            if not keyframe_file:
+                break
+            keyframe_images.append(keyframe_file.read())
+            index += 1
 
         app.logger.info(
-            "[media-source] video ocr_text_len=%d candidates=%d",
-            len(ocr_text), len(candidates)
+            "[media-source] video ocr_text_len=%d candidates=%d keyframes=%d",
+            len(ocr_text), len(candidates), len(keyframe_images)
         )
-        result = media_source_analyze_video(ocr_text, candidates)
+        result = media_source_analyze_video(ocr_text, candidates, keyframe_images)
         app.logger.info(
             "[media-source] video outcome=%s topMatch=%s otherMatches=%d",
             result.get("outcome"),
