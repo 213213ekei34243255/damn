@@ -89,7 +89,13 @@ MODEL_CONFIG = {
         "enabled": False,
         "provider": "huggingface-serverless",
         "model": "google/videoprism-base-f16r288",
-        "reason": "Video mode is Phase 2 - not implemented yet.",
+        "reason": (
+            "Raw JAX research checkpoint (458MB) with no evidence of any "
+            "HF Inference Provider deployment. Video mode (Phase 2) is "
+            "implemented without it - see analyze_video_candidates(), "
+            "which is text/keyword-only against OCR'd keyframes / an HF "
+            "caption fallback, with no visual comparison step at all."
+        ),
     },
     "audioIdentification": {
         "enabled": False,
@@ -303,6 +309,79 @@ def analyze_image(original_image_bytes: bytes, ocr_text: str, candidates: list) 
     for m in scored:
         m.pop("_distance", None)
         m.pop("_text_overlap", None)
+
+    content_summary = ocr_text.strip() if ocr_text and ocr_text.strip() else None
+
+    if not scored:
+        outcome = "content_identified_source_not_found" if content_summary else "source_not_found"
+        return {
+            "outcome": outcome,
+            "topMatch": None,
+            "otherMatches": [],
+            "ocrText": ocr_text or None,
+            "contentSummary": content_summary,
+        }
+
+    return {
+        "outcome": "found",
+        "topMatch": scored[0],
+        "otherMatches": scored[1:],
+        "ocrText": ocr_text or None,
+        "contentSummary": content_summary,
+    }
+
+
+def analyze_video_candidates(ocr_text: str, candidates: list) -> dict:
+    """
+    Video mode (Phase 2). Unlike analyze_image, there is NO visual
+    comparison step here - fetching and decoding an arbitrary candidate
+    page's video to compare against submitted keyframes isn't feasible
+    within a request timeout, and VideoPrism has no confirmed free
+    serverless inference either (see MODEL_CONFIG). Every result here is
+    a text/keyword match against OCR'd keyframe text (or an HF-generated
+    caption when no keyframe had visible text) - matchKind is always
+    "text_match", and confidence never exceeds "possible_source" since
+    there's no visual evidence to justify "likely_original_source".
+
+    candidates: list of {"url", "title", "snippet"} from the client's
+    GoogleSearchService.searchWeb() call - a plain web search for PAGES,
+    not an image search, since video mode is looking for a page that
+    might host/describe the video, not a matching thumbnail.
+    """
+    scored = []
+    for candidate in candidates[:MAX_CANDIDATES]:
+        url = candidate.get("url") or ""
+        title = candidate.get("title") or ""
+        snippet = candidate.get("snippet") or ""
+        if not url:
+            continue
+
+        overlap = _text_overlap(ocr_text, f"{title} {snippet}")
+        accepted = overlap >= TEXT_MATCH_MIN_OVERLAP
+
+        logger.info(
+            "[media-source] video candidate url=%s text_overlap=%.2f accepted=%s",
+            url, overlap, accepted,
+        )
+
+        if not accepted:
+            continue
+
+        scored.append({
+            "url": url,
+            "domain": _domain(url),
+            "title": title or None,
+            "confidence": "possible_source",
+            "confidencePercent": min(90, int(30 + overlap * 60)),
+            "matchKind": "text_match",
+            "evidence": ["Matching text/caption"],
+            "thumbnailURL": None,
+            "_overlap": overlap,
+        })
+
+    scored.sort(key=lambda m: -m["_overlap"])
+    for m in scored:
+        m.pop("_overlap", None)
 
     content_summary = ocr_text.strip() if ocr_text and ocr_text.strip() else None
 
