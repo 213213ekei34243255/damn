@@ -4,6 +4,7 @@ from flask_cors import CORS
 import os
 from agent import get_agent_plan, needs_page_content
 from media_source_finder import analyze_image as media_source_analyze_image
+from media_source_finder import generate_caption as media_source_generate_caption
 import google.generativeai as genai
 import re
 import logging
@@ -457,6 +458,35 @@ def predict():
         return jsonify({"error": "An unexpected error occurred."}), 500
 
 
+@app.route("/media-source/caption", methods=["POST"])
+def media_source_caption():
+    """
+    Called by the client ONLY when on-device OCR found no usable text
+    (a content-only photo - e.g. an animal with no visible text). Runs
+    a Hugging Face image-captioning model to turn the photo into a text
+    description the client can then feed into the same keyword search
+    OCR text would otherwise drive. This is NOT reverse-image search -
+    see media_source_finder.py's docstring for why that's not possible
+    here without a paid visual-search API. Always returns 200 with
+    caption possibly null (missing token, model cold-start, or network
+    failure) rather than erroring the whole flow - a missing caption
+    just means the client proceeds straight to "no candidates found."
+    """
+    try:
+        image_file = request.files.get("image")
+        if not image_file:
+            return jsonify({"error": "Missing image."}), 400
+
+        image_bytes = image_file.read()
+        caption = media_source_generate_caption(image_bytes)
+        app.logger.info("[media-source] caption result: %r", caption)
+        return jsonify({"caption": caption}), 200
+
+    except Exception:
+        app.logger.exception("Error in /media-source/caption")
+        return jsonify({"caption": None}), 200
+
+
 @app.route("/media-source/image", methods=["POST"])
 def media_source_image():
     """
@@ -487,7 +517,17 @@ def media_source_image():
             app.logger.warning("media-source/image: could not parse candidates JSON")
 
         image_bytes = image_file.read()
+        app.logger.info(
+            "[media-source] image_bytes=%d ocr_text_len=%d candidates=%d",
+            len(image_bytes), len(ocr_text), len(candidates)
+        )
         result = media_source_analyze_image(image_bytes, ocr_text, candidates)
+        app.logger.info(
+            "[media-source] outcome=%s topMatch=%s otherMatches=%d",
+            result.get("outcome"),
+            (result.get("topMatch") or {}).get("domain"),
+            len(result.get("otherMatches") or []),
+        )
         return jsonify(result), 200
 
     except Exception:
