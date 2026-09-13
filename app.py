@@ -6,6 +6,7 @@ from agent import get_agent_plan, needs_page_content
 from media_source_finder import analyze_image as media_source_analyze_image
 from media_source_finder import generate_caption as media_source_generate_caption
 from media_source_finder import analyze_video as media_source_analyze_video
+from media_source_finder import identify_audio as media_source_identify_audio
 import google.generativeai as genai
 import re
 import logging
@@ -589,6 +590,37 @@ def media_source_video():
     except Exception:
         app.logger.exception("Error in /media-source/video")
         return jsonify({"error": "An unexpected error occurred analyzing that video."}), 500
+
+
+@app.route("/media-source/audio", methods=["POST"])
+def media_source_audio():
+    """
+    Audio-mode Media Source Finder (Phase 3). Multipart form: `audio`
+    (the uploaded audio file - mp3/m4a/wav, up to AudD's 10MB standard-
+    endpoint limit). Real acoustic-fingerprint recognition via AudD -
+    see identify_audio()'s docstring for why "not_configured" (no
+    AUDD_API_TOKEN set) and "not_found" (AudD analyzed it, no match -
+    also the correct outcome for speech/noise/non-music) are kept
+    distinct, and why no confidence percentage or song details are ever
+    fabricated.
+    """
+    try:
+        audio_file = request.files.get("audio")
+        if not audio_file:
+            return jsonify({"error": "Missing audio file."}), 400
+
+        audio_bytes = audio_file.read()
+        app.logger.info("[media-source] audio_bytes=%d", len(audio_bytes))
+        result = media_source_identify_audio(audio_bytes)
+        app.logger.info(
+            "[media-source] audio outcome=%s title=%s artist=%s",
+            result.get("outcome"), result.get("title"), result.get("artist"),
+        )
+        return jsonify(result), 200
+
+    except Exception:
+        app.logger.exception("Error in /media-source/audio")
+        return jsonify({"error": "An unexpected error occurred analyzing that audio."}), 500
 
 
 @app.route('/export_conversations', methods=['GET'])
