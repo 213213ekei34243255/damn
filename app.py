@@ -5,6 +5,7 @@ import os
 from agent import get_agent_plan, needs_page_content
 from media_source_finder import analyze_image as media_source_analyze_image
 from media_source_finder import generate_caption as media_source_generate_caption
+from media_source_finder import analyze_video_candidates as media_source_analyze_video
 import google.generativeai as genai
 import re
 import logging
@@ -533,6 +534,43 @@ def media_source_image():
     except Exception:
         app.logger.exception("Error in /media-source/image")
         return jsonify({"error": "An unexpected error occurred analyzing that image."}), 500
+
+
+@app.route("/media-source/video", methods=["POST"])
+def media_source_video():
+    """
+    Video-mode Media Source Finder (Phase 2). JSON body: `ocr_text`
+    (aggregated OCR across the client's scene-change-detected keyframes,
+    or an HF caption when no keyframe had visible text), `candidates`
+    (a JSON array of {"url", "title", "snippet"} from the client's
+    GoogleSearchService.searchWeb() call - a plain web search for pages,
+    not an image search). Text/keyword-only ranking - see
+    analyze_video_candidates()'s docstring for why there's no visual
+    comparison step here, unlike Image mode.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        ocr_text = data.get("ocr_text", "")
+        candidates = data.get("candidates", [])
+        if not isinstance(candidates, list):
+            candidates = []
+
+        app.logger.info(
+            "[media-source] video ocr_text_len=%d candidates=%d",
+            len(ocr_text), len(candidates)
+        )
+        result = media_source_analyze_video(ocr_text, candidates)
+        app.logger.info(
+            "[media-source] video outcome=%s topMatch=%s otherMatches=%d",
+            result.get("outcome"),
+            (result.get("topMatch") or {}).get("domain"),
+            len(result.get("otherMatches") or []),
+        )
+        return jsonify(result), 200
+
+    except Exception:
+        app.logger.exception("Error in /media-source/video")
+        return jsonify({"error": "An unexpected error occurred analyzing that video."}), 500
 
 
 @app.route('/export_conversations', methods=['GET'])
