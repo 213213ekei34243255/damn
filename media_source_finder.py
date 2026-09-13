@@ -58,11 +58,19 @@ import io
 import logging
 import os
 import re
+import shutil
+import tempfile
 from typing import Optional
 
 import requests
 from PIL import Image
 import imagehash
+
+try:
+    import acoustid
+    _ACOUSTID_LIB_AVAILABLE = True
+except ImportError:
+    _ACOUSTID_LIB_AVAILABLE = False
 
 logger = logging.getLogger("MediaSourceFinder")
 
@@ -99,9 +107,23 @@ MODEL_CONFIG = {
         ),
     },
     "audioIdentification": {
-        "enabled": False,
-        "provider": "audd",
-        "reason": "Audio mode is Phase 3 - not implemented yet; no API key configured.",
+        "enabled": False,  # recomputed at runtime from ACOUSTID_API_KEY/AUDD_API_TOKEN - see below
+        "provider": "acoustid+audd",
+        "model": "Chromaprint/AcoustID (free, tried first) then AudD standard endpoint (paid, fallback)",
+        "reason": (
+            "Real acoustic-fingerprint music recognition - not a generic "
+            "HF audio model (no free HF model can identify arbitrary "
+            "songs; see the note on microsoft/wavlm-base-plus - it's a "
+            "speech/audio representation model, not a fingerprinting "
+            "database, so it's not used here at all). AcoustID is free "
+            "but its web-service tier is documented for non-commercial/"
+            "open-source use only - a real ToS consideration for a paid "
+            "app, not something this code resolves for you. Requires "
+            "ACOUSTID_API_KEY and/or AUDD_API_TOKEN; returns "
+            "outcome=not_configured (distinct from a genuine not_found) "
+            "only when NEITHER is set - the UI must never blur those "
+            "two into the same message."
+        ),
     },
     "imageCaption": {
         "enabled": True,
@@ -134,6 +156,9 @@ MODEL_CONFIG = {
     },
 }
 MODEL_CONFIG["visualSearch"]["enabled"] = bool(os.environ.get("GOOGLE_VISION_API_KEY"))
+MODEL_CONFIG["audioIdentification"]["enabled"] = bool(
+    os.environ.get("ACOUSTID_API_KEY") or os.environ.get("AUDD_API_TOKEN")
+)
 
 MAX_CANDIDATES = 8
 CANDIDATE_FETCH_TIMEOUT_S = 6
@@ -655,3 +680,197 @@ def analyze_video_candidates(ocr_text: str, candidates: list) -> dict:
         "ocrText": ocr_text or None,
         "contentSummary": content_summary,
     }
+
+
+# --------------------------------------------------------------------
+# Audio mode (Phase 3) - real acoustic-fingerprint music recognition.
+# Two providers, tried in order:
+#
+#   1. AcoustID (free) - Chromaprint fingerprinting (the `fpcalc` binary,
+#      installed via the Dockerfile's `libchromaprint-tools` package) +
+#      AcoustID's crowd-sourced fingerprint database, tied to
+#      MusicBrainz for metadata. Needs ACOUSTID_API_KEY - free
+#      registration at acoustid.org/api-key, NOT the same as installing
+#      Chromaprint itself. IMPORTANT: AcoustID's free web-service tier
+#      is documented as being for non-commercial/open-source use only
+#      (acoustid.org/webservice) - that's a real ToS consideration for
+#      a paid app, not something this code can resolve for you.
+#      Coverage is real but narrower than AudD's, since it depends on
+#      volunteer-submitted fingerprints rather than a licensed catalog.
+#   2. AudD (paid, api.audd.io) - broader commercial-catalog coverage,
+#      used only if AcoustID isn't configured or didn't find anything.
+#
+# Neither is a Hugging Face model - no free HF model can identify an
+# arbitrary song the way a real fingerprinting database can (see
+# MODEL_CONFIG's note on microsoft/wavlm-base-plus). Adding a third
+# provider later (e.g. ACRCloud) means adding another
+# _identify_via_<provider>() function and a line in identify_audio()'s
+# try-in-order chain - the route and the iOS side never need to change.
+# --------------------------------------------------------------------
+
+ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY")
+# AcoustID's own match score is 0-1; below this, treat it as no real
+# match rather than surfacing a shaky guess as a confirmed song.
+ACOUSTID_MIN_SCORE = 0.5
+
+AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN")
+AUDD_URL = "https://api.audd.io/"
+AUDD_TIMEOUT_S = 20
+# AudD's own documented limit for the standard (non-enterprise) endpoint.
+AUDD_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _empty_audio_result(outcome: str) -> dict:
+    return {
+        "outcome": outcome,
+        "title": None,
+        "artist": None,
+        "album": None,
+        "matchingSource": None,
+    }
+
+
+def _identify_via_acoustid(audio_bytes: bytes) -> Optional[dict]:
+    """
+    Returns None if AcoustID itself isn't usable right now (no API key,
+    fpcalc/pyacoustid missing, or the request errored) - the caller
+    reads None as "try the next provider," not as a real "no song"
+    answer. Returns an actual result dict once AcoustID was genuinely
+    asked and gave a definitive answer (identified or not_found).
+    """
+    if not ACOUSTID_API_KEY:
+        return None
+    if not _ACOUSTID_LIB_AVAILABLE:
+        logger.warning("[media-source] ACOUSTID_API_KEY is set but the 'pyacoustid' package isn't installed")
+        return None
+    if not shutil.which("fpcalc"):
+        logger.warning("[media-source] ACOUSTID_API_KEY is set but fpcalc isn't installed (check the Dockerfile has libchromaprint-tools)")
+        return None
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        # force_fpcalc=True: the Dockerfile only installs the fpcalc
+        # CLI tool, not the Chromaprint dynamic library pyacoustid would
+        # otherwise prefer - forcing fpcalc avoids depending on a
+        # library that isn't actually installed.
+        best = None
+        for score, recording_id, title, artist in acoustid.match(
+            ACOUSTID_API_KEY, tmp_path, force_fpcalc=True
+        ):
+            if not title:
+                continue
+            if best is None or score > best[0]:
+                best = (score, recording_id, title, artist)
+
+        if best is None or best[0] < ACOUSTID_MIN_SCORE:
+            logger.info("[media-source] AcoustID processed the audio - no confident match (best=%s)", best)
+            return _empty_audio_result("not_found")
+
+        score, recording_id, title, artist = best
+        logger.info("[media-source] AcoustID identified: %s - %s (score=%.2f)", artist, title, score)
+        return {
+            "outcome": "identified",
+            "title": title,
+            "artist": artist,
+            "album": None,
+            "matchingSource": "MusicBrainz (via AcoustID)",
+        }
+
+    except Exception as e:
+        logger.info("[media-source] AcoustID lookup failed: %s", e)
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _identify_via_audd(audio_bytes: bytes) -> dict:
+    """
+    Always returns a real result dict (never None) - "not_configured"
+    is itself a valid, final answer here since AudD is the last
+    provider in the chain. Never fabricates a title/artist/album, and
+    never invents a numeric confidence score - AudD's standard endpoint
+    doesn't return one (matching is a binary fingerprint hit), so the
+    client shows a fixed "verified match" label instead of a made-up
+    percentage.
+    """
+    if not AUDD_API_TOKEN:
+        return _empty_audio_result("not_configured")
+
+    if len(audio_bytes) > AUDD_MAX_BYTES:
+        logger.info("[media-source] audio file (%d bytes) exceeds AudD's 10MB standard-endpoint limit", len(audio_bytes))
+        return _empty_audio_result("not_found")
+
+    try:
+        resp = requests.post(
+            AUDD_URL,
+            data={"api_token": AUDD_API_TOKEN, "return": "apple_music,spotify"},
+            files={"file": ("audio", audio_bytes)},
+            timeout=AUDD_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        logger.info("[media-source] AudD request failed: %s", e)
+        return _empty_audio_result("not_found")
+
+    if payload.get("status") != "success":
+        logger.warning("[media-source] AudD returned a non-success response: %s", payload)
+        return _empty_audio_result("not_found")
+
+    result = payload.get("result")
+    if not result:
+        logger.info("[media-source] AudD analyzed the audio - no fingerprint match (expected for speech/noise/non-music)")
+        return _empty_audio_result("not_found")
+
+    if result.get("spotify"):
+        matching_source = "Spotify"
+    elif result.get("apple_music"):
+        matching_source = "Apple Music"
+    else:
+        matching_source = result.get("song_link")
+
+    logger.info("[media-source] AudD identified: %s - %s", result.get("artist"), result.get("title"))
+    return {
+        "outcome": "identified",
+        "title": result.get("title"),
+        "artist": result.get("artist"),
+        "album": result.get("album"),
+        "matchingSource": matching_source,
+    }
+
+
+def identify_audio(audio_bytes: bytes) -> dict:
+    """
+    Returns a dict with `outcome` of "identified" / "not_found" /
+    "not_configured" - matches iOS's AudioIdentificationResult exactly.
+
+    Tries AcoustID (free) first, then AudD (paid) if AcoustID isn't
+    configured or didn't find anything. "not_configured" and
+    "not_found" are DELIBERATELY distinct and must never be blurred
+    into the same UI message: not_configured means NEITHER provider is
+    set up at all, while not_found means at least one of them actually
+    analyzed the audio and found no fingerprint match - which is also
+    the CORRECT, expected outcome for speech, traffic, wind, or any
+    non-music recording, since both providers' databases are music-
+    specific.
+    """
+    acoustid_result = _identify_via_acoustid(audio_bytes)
+    if acoustid_result is not None and acoustid_result["outcome"] == "identified":
+        return acoustid_result
+
+    audd_result = _identify_via_audd(audio_bytes)
+    if audd_result["outcome"] == "identified":
+        return audd_result
+
+    if acoustid_result is not None or audd_result["outcome"] != "not_configured":
+        return _empty_audio_result("not_found")
+    logger.info("[media-source] neither ACOUSTID_API_KEY nor AUDD_API_TOKEN is set - audio identification not configured")
+    return _empty_audio_result("not_configured")
