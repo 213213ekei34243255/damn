@@ -53,6 +53,7 @@ simplification forced by real model availability - not a stopgap
 hiding a broken integration.
 """
 
+import base64
 import io
 import logging
 import os
@@ -114,7 +115,25 @@ MODEL_CONFIG = {
             "never blocks the rest of the pipeline."
         ),
     },
+    "visualSearch": {
+        "enabled": False,  # recomputed at runtime from GOOGLE_VISION_API_KEY - see below
+        "provider": "google-cloud-vision",
+        "model": "Web Detection (images:annotate)",
+        "reason": (
+            "The one genuine reverse-image-search capability available to "
+            "this feature - actually finds pages containing this exact or "
+            "visually similar image via Google's own web index, unlike "
+            "the free OCR+perceptual-hash+keyword-search pipeline below. "
+            "A DIFFERENT Google product from the Custom Search JSON API "
+            "this app already uses for text/image-by-keyword search - "
+            "needs its own GOOGLE_VISION_API_KEY (Cloud Vision API "
+            "enabled in Google Cloud Console; has its own free tier). "
+            "Optional: the free pipeline remains the fallback when this "
+            "isn't configured, or when Vision runs but finds nothing."
+        ),
+    },
 }
+MODEL_CONFIG["visualSearch"]["enabled"] = bool(os.environ.get("GOOGLE_VISION_API_KEY"))
 
 MAX_CANDIDATES = 8
 CANDIDATE_FETCH_TIMEOUT_S = 6
@@ -163,6 +182,126 @@ def generate_caption(image_bytes: bytes) -> Optional[str]:
     except Exception as e:
         logger.info("[media-source] caption generation failed: %s", e)
         return None
+
+
+# --------------------------------------------------------------------
+# Google Cloud Vision Web Detection - genuine reverse-image search.
+#
+# This is a DIFFERENT Google product from the Custom Search JSON API
+# (GoogleSearchService.swift's searchWeb/searchImages) this app already
+# uses elsewhere - Custom Search only ever searches BY TEXT KEYWORDS,
+# never by image content. Web Detection is the actual "search by
+# providing an image" capability - what "reverse image search" and
+# "Google Lens"-style tools are really built on. Needs its own
+# GOOGLE_VISION_API_KEY (enable "Cloud Vision API" in Google Cloud
+# Console; it has its own free tier separate from Custom Search's).
+# --------------------------------------------------------------------
+
+GOOGLE_VISION_API_KEY = os.environ.get("GOOGLE_VISION_API_KEY")
+GOOGLE_VISION_URL = "https://vision.googleapis.com/v1/images:annotate"
+GOOGLE_VISION_TIMEOUT_S = 20
+# Vision Web Detection is billed per call - capping how many keyframes
+# of a video get checked keeps a single video analysis from silently
+# burning through a lot of quota.
+MAX_VIDEO_KEYFRAMES_FOR_VISION = 3
+
+
+def _web_detect(image_bytes: bytes) -> Optional[dict]:
+    """
+    Calls Web Detection on one image. Returns the raw `webDetection`
+    object (fullMatchingImages / partialMatchingImages /
+    pagesWithMatchingImages / visuallySimilarImages / bestGuessLabels),
+    or None on any failure (missing key, network error, bad response,
+    or the API itself returning an error for this image) - callers fall
+    back to the free pipeline in every one of those cases, never raise.
+    """
+    if not GOOGLE_VISION_API_KEY:
+        return None
+    try:
+        payload = {
+            "requests": [{
+                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                "features": [{"type": "WEB_DETECTION", "maxResults": 10}],
+            }]
+        }
+        resp = requests.post(
+            GOOGLE_VISION_URL,
+            params={"key": GOOGLE_VISION_API_KEY},
+            json=payload,
+            timeout=GOOGLE_VISION_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        responses = (resp.json() or {}).get("responses") or []
+        if not responses:
+            return None
+        if "error" in responses[0]:
+            logger.warning("[media-source] Vision API returned an error: %s", responses[0]["error"])
+            return None
+        return responses[0].get("webDetection")
+    except Exception as e:
+        logger.info("[media-source] Vision Web Detection call failed: %s", e)
+        return None
+
+
+def _score_web_detection(web_detection: dict) -> list:
+    """
+    Turns one image's webDetection payload into the same scored-match
+    shape the free pipeline produces, so the rest of the response (JSON
+    shape, sorting) is identical regardless of which provider actually
+    found the matches. A page with a fullMatchingImages entry is real,
+    strong evidence (the exact image was found there) - never
+    downgraded to a guess.
+    """
+    if not web_detection:
+        return []
+
+    scored = []
+    for page in web_detection.get("pagesWithMatchingImages", [])[:MAX_CANDIDATES]:
+        url = page.get("url") or ""
+        if not url:
+            continue
+
+        full = [m.get("url") for m in page.get("fullMatchingImages", []) if m.get("url")]
+        partial = [m.get("url") for m in page.get("partialMatchingImages", []) if m.get("url")]
+
+        if full:
+            confidence, confidence_percent = "likely_original_source", 95
+            evidence = ["Exact visual match (Google Web Detection)"]
+            thumbnail = full[0]
+        elif partial:
+            confidence, confidence_percent = "possible_source", 70
+            evidence = ["Partial/cropped visual match (Google Web Detection)"]
+            thumbnail = partial[0]
+        else:
+            continue
+
+        scored.append({
+            "url": url,
+            "domain": _domain(url),
+            "title": page.get("pageTitle") or None,
+            "confidence": confidence,
+            "confidencePercent": confidence_percent,
+            "matchKind": "visual_match",
+            "evidence": evidence,
+            "thumbnailURL": thumbnail,
+            "_rank": 0 if full else 1,
+        })
+
+    scored.sort(key=lambda m: m["_rank"])
+    for m in scored:
+        m.pop("_rank", None)
+    return scored
+
+
+def _best_guess_summary(web_detection: Optional[dict]) -> Optional[str]:
+    """Google's own best-guess description of the image - genuinely
+    better than the HF caption fallback when available, since it comes
+    from the same system that just found (or didn't find) real matches
+    for it, not a generic captioning model with no web knowledge."""
+    if not web_detection:
+        return None
+    labels = [l.get("label") for l in (web_detection.get("bestGuessLabels") or []) if l.get("label")]
+    return ", ".join(labels) if labels else None
 
 # Perceptual-hash Hamming-distance thresholds on a 64-bit phash
 # (0 = identical structure, 64 = maximally different). Tuned
@@ -220,6 +359,41 @@ def _fetch_image_hash(url: str):
 
 
 def analyze_image(original_image_bytes: bytes, ocr_text: str, candidates: list) -> dict:
+    """
+    Tries Google Cloud Vision's Web Detection first (genuine reverse-
+    image search) when GOOGLE_VISION_API_KEY is configured - this is
+    what actually closes the gap the free pipeline can't: finding a
+    source for a content-only photo with no useful text at all. Falls
+    back to the free OCR+perceptual-hash+keyword-search pipeline
+    (_analyze_image_free_pipeline) when Vision isn't configured, or
+    when it runs but finds no matching pages.
+    """
+    web_detection = _web_detect(original_image_bytes)
+    vision_summary = _best_guess_summary(web_detection)
+
+    if web_detection is not None:
+        scored = _score_web_detection(web_detection)
+        if scored:
+            content_summary = (ocr_text.strip() if ocr_text and ocr_text.strip() else None) or vision_summary
+            logger.info("[media-source] Vision Web Detection found %d matching page(s)", len(scored))
+            return {
+                "outcome": "found",
+                "topMatch": scored[0],
+                "otherMatches": scored[1:],
+                "ocrText": ocr_text or None,
+                "contentSummary": content_summary,
+            }
+        logger.info("[media-source] Vision Web Detection configured but found no matching pages - falling back to free pipeline")
+
+    result = _analyze_image_free_pipeline(original_image_bytes, ocr_text, candidates)
+    if not result.get("contentSummary") and vision_summary:
+        result["contentSummary"] = vision_summary
+        if result["outcome"] == "source_not_found":
+            result["outcome"] = "content_identified_source_not_found"
+    return result
+
+
+def _analyze_image_free_pipeline(original_image_bytes: bytes, ocr_text: str, candidates: list) -> dict:
     """
     candidates: list of {"url", "contextLink", "title"} from the
     client's GoogleSearchService.searchImages() call - real keyword-
@@ -329,6 +503,85 @@ def analyze_image(original_image_bytes: bytes, ocr_text: str, candidates: list) 
         "ocrText": ocr_text or None,
         "contentSummary": content_summary,
     }
+
+
+def analyze_video(ocr_text: str, candidates: list, keyframe_images: list) -> dict:
+    """
+    keyframe_images: raw JPEG bytes for a handful of representative
+    keyframes (already capped small client-side - each is a billed
+    Vision API call, so only MAX_VIDEO_KEYFRAMES_FOR_VISION of them are
+    checked here regardless of how many were passed in).
+
+    Runs Web Detection on each keyframe and aggregates by destination
+    page: a page whose image matched MULTIPLE keyframes is meaningfully
+    stronger evidence than matching just one (the spec's own suggested
+    "Multiple keyframes matched" evidence line), which the text-only
+    pipeline below has no way to express at all. Falls back to
+    analyze_video_candidates() (text-only) when Vision isn't
+    configured, or ran but found nothing.
+    """
+    if GOOGLE_VISION_API_KEY and keyframe_images:
+        page_matches = {}
+        for frame_bytes in keyframe_images[:MAX_VIDEO_KEYFRAMES_FOR_VISION]:
+            web_detection = _web_detect(frame_bytes)
+            if not web_detection:
+                continue
+            for page in web_detection.get("pagesWithMatchingImages", []):
+                url = page.get("url") or ""
+                if not url:
+                    continue
+                full = [m.get("url") for m in page.get("fullMatchingImages", []) if m.get("url")]
+                partial = [m.get("url") for m in page.get("partialMatchingImages", []) if m.get("url")]
+                if not full and not partial:
+                    continue
+
+                entry = page_matches.setdefault(url, {
+                    "count": 0, "title": page.get("pageTitle"),
+                    "has_full": False, "thumbnail": (full or partial)[0],
+                })
+                entry["count"] += 1
+                if full:
+                    entry["has_full"] = True
+
+        if page_matches:
+            scored = []
+            for url, info in page_matches.items():
+                multi = info["count"] > 1
+                if info["has_full"]:
+                    confidence = "likely_original_source"
+                    confidence_percent = 95 if multi else 85
+                    evidence = ["Multiple keyframes matched (Google Web Detection)"] if multi else ["Exact visual match (Google Web Detection)"]
+                else:
+                    confidence = "possible_source"
+                    confidence_percent = 75 if multi else 60
+                    evidence = ["Multiple keyframes partially matched (Google Web Detection)"] if multi else ["Partial/cropped visual match (Google Web Detection)"]
+                scored.append({
+                    "url": url,
+                    "domain": _domain(url),
+                    "title": info["title"] or None,
+                    "confidence": confidence,
+                    "confidencePercent": confidence_percent,
+                    "matchKind": "visual_match",
+                    "evidence": evidence,
+                    "thumbnailURL": info["thumbnail"],
+                    "_rank": (0 if info["has_full"] else 1, -info["count"]),
+                })
+            scored.sort(key=lambda m: m["_rank"])
+            for m in scored:
+                m.pop("_rank", None)
+
+            logger.info("[media-source] video Vision Web Detection found %d matching page(s) across keyframes", len(scored))
+            content_summary = ocr_text.strip() if ocr_text and ocr_text.strip() else None
+            return {
+                "outcome": "found",
+                "topMatch": scored[0],
+                "otherMatches": scored[1:],
+                "ocrText": ocr_text or None,
+                "contentSummary": content_summary,
+            }
+        logger.info("[media-source] video Vision Web Detection configured but found nothing across keyframes - falling back to text-only pipeline")
+
+    return analyze_video_candidates(ocr_text, candidates)
 
 
 def analyze_video_candidates(ocr_text: str, candidates: list) -> dict:
