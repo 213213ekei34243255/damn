@@ -25,18 +25,37 @@ which must stay truthful about what's really running):
   implemented yet, so not evaluated here.
 - Audio identification (AudD/ACRCloud): Phase 3 - not implemented yet,
   no API key configured.
+- nlpconnect/vit-gpt2-image-captioning: UNLIKE every model above, this
+  one has documented serverless Inference API support (Hugging Face's
+  own huggingface.js client library ships an imageToText() example
+  using this exact model). ENABLED, with a runtime fallback: if
+  HF_API_TOKEN isn't set, or the call fails/errors/cold-starts, this
+  degrades to no caption rather than breaking the request - see
+  generate_caption() below. Used ONLY as a text-query source when
+  on-device OCR finds nothing (a content-only photo, e.g. an animal
+  with no visible text) - it turns the photo into a caption like "a
+  lion standing in grass" and that feeds into the SAME keyword search
+  OCR text would otherwise drive. This is NOT reverse-image search -
+  it can only help discover pages that happen to use similar words in
+  their own text, same honest limitation as the OCR-driven path. True
+  "find the exact page this photo was published on" requires a real
+  visual-search index (Google Vision Web Detection / Bing Visual
+  Search / TinEye), none of which exist for free - see the
+  conversation this was scoped from for why that trade-off was made.
 
-Because both of the models actually named for Image mode turned out to
-be unusable via free serverless inference, this pipeline runs with NO
-cloud ML model dependency at all: perceptual hashing for visual
-similarity, on-device OCR (client-side) for text, and the app's
-existing Google Custom Search image-search proxy for candidate
-discovery. That's a deliberate, honest simplification - not a stopgap
+Because every image-embedding and OCR model actually named for Image
+mode turned out to be unusable via free serverless inference, this
+pipeline's visual-similarity signal is perceptual hashing (pure
+Python/Pillow math, no model at all) plus on-device OCR (client-side)
+plus this one captioning fallback - not the MobileCLIP/PP-OCRv6
+pipeline originally specified. That's a deliberate, honest
+simplification forced by real model availability - not a stopgap
 hiding a broken integration.
 """
 
 import io
 import logging
+import os
 import re
 from typing import Optional
 
@@ -77,11 +96,67 @@ MODEL_CONFIG = {
         "provider": "audd",
         "reason": "Audio mode is Phase 3 - not implemented yet; no API key configured.",
     },
+    "imageCaption": {
+        "enabled": True,
+        "provider": "huggingface-serverless",
+        "model": "nlpconnect/vit-gpt2-image-captioning",
+        "reason": (
+            "Has documented serverless Inference API support (unlike "
+            "MobileCLIP/BLIP/PP-OCRv6/VideoPrism). Requires HF_API_TOKEN "
+            "to be set; degrades to no-caption at runtime if the token is "
+            "missing, the call errors, or the model is cold-starting - "
+            "never blocks the rest of the pipeline."
+        ),
+    },
 }
 
 MAX_CANDIDATES = 8
 CANDIDATE_FETCH_TIMEOUT_S = 6
 MAX_CANDIDATE_BYTES = 8 * 1024 * 1024  # refuse to download absurdly large "images"
+
+# Free Hugging Face account access token (huggingface.co/settings/tokens)
+# - NOT a paid Inference Endpoint. Server-side only; never sent to the
+# client. Captioning is simply skipped if this isn't set.
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
+HF_CAPTION_MODEL = "nlpconnect/vit-gpt2-image-captioning"
+HF_CAPTION_URL = f"https://api-inference.huggingface.co/models/{HF_CAPTION_MODEL}"
+HF_CAPTION_TIMEOUT_S = 20
+
+
+def generate_caption(image_bytes: bytes) -> Optional[str]:
+    """
+    Best-effort image-to-text caption via Hugging Face's free serverless
+    Inference API - used only when on-device OCR found no usable text
+    (see MediaSourceFinderService.swift). Returns None (never raises) on
+    any failure: missing token, network error, bad response, or a cold-
+    starting model (HF returns 503 with an estimated load time in that
+    case - this does not wait/retry, since that would stall a live user
+    request; the pipeline just proceeds without a caption that time).
+    """
+    if not HF_API_TOKEN:
+        logger.info("[media-source] HF_API_TOKEN not set - captioning disabled")
+        return None
+    try:
+        resp = requests.post(
+            HF_CAPTION_URL,
+            headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+            data=image_bytes,
+            timeout=HF_CAPTION_TIMEOUT_S,
+        )
+        if resp.status_code == 503:
+            logger.info("[media-source] caption model is cold-starting, skipping this request")
+            return None
+        resp.raise_for_status()
+        result = resp.json()
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            caption = result[0].get("generated_text")
+            if caption:
+                return caption.strip()
+        logger.info("[media-source] caption response had no generated_text: %r", result)
+        return None
+    except Exception as e:
+        logger.info("[media-source] caption generation failed: %s", e)
+        return None
 
 # Perceptual-hash Hamming-distance thresholds on a 64-bit phash
 # (0 = identical structure, 64 = maximally different). Tuned
@@ -175,6 +250,11 @@ def analyze_image(original_image_bytes: bytes, ocr_text: str, candidates: list) 
 
         is_visual = distance is not None and distance <= VISUAL_MATCH_MAX_DISTANCE
         is_text = text_overlap >= TEXT_MATCH_MIN_OVERLAP
+
+        logger.info(
+            "[media-source] candidate url=%s hash_fetched=%s distance=%s text_overlap=%.2f accepted=%s",
+            url, candidate_hash is not None, distance, text_overlap, (is_visual or is_text),
+        )
 
         if not is_visual and not is_text:
             continue
