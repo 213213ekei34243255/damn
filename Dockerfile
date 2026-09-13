@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     tar \
     ca-certificates \
     libgomp1 \
+    ffmpeg \
+    libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/llama && \
