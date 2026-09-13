@@ -386,10 +386,24 @@ def predict():
 
             return jsonify({"answer": "I couldn't find a matching command. Try again with clearer words."}), 200
 
+        # The Trust Engine sends a long, self-contained analysis prompt
+        # (url="trust-engine", user_agent="Jonah-iOS-TrustEngine") that has
+        # nothing to do with "the webpage the user currently has open" -
+        # there is no page to fetch. But that prompt's own JSON output
+        # schema literally contains the word "summary" as a field name,
+        # which is exactly what _PAGE_CONTENT_HINTS matches on. That made
+        # needs_page_content() return True for every single trust check,
+        # for every brand, with no exceptions - so /predict always replied
+        # {"needs_page_content": true} instead of ever actually answering,
+        # and TrustService.swift silently fell back to its crude keyword
+        # counter (which is what was actually producing scores like 0/100
+        # for well-known brands/leagues - the LLM was never being asked).
+        is_trust_engine_call = (user_agent == "Jonah-iOS-TrustEngine")
+
         if page_content:
             if len(page_content) > MAX_PAGE_CONTENT_CHARS:
                 page_content = page_content[:MAX_PAGE_CONTENT_CHARS] + "\n...[truncated]"
-        else:
+        elif not is_trust_engine_call:
             if needs_page_content(text):
                 app.logger.info("Chat message needs page content but none was sent yet; requesting it from the client.")
                 return jsonify({"needs_page_content": True}), 200
@@ -402,13 +416,13 @@ def predict():
         # (not the client) is the bug, and exactly which phrasing it's
         # missing.
         already_has_web_content = bool(web_content)
-        would_request_search = (not already_has_web_content) and needs_web_search(text)
+        would_request_search = (not already_has_web_content) and not is_trust_engine_call and needs_web_search(text)
         app.logger.info(
             "[web-search-gate] session=%s already_has_web_content=%s needs_web_search=%s text=%r",
             session_id, already_has_web_content, would_request_search, text
         )
 
-        if not web_content and needs_web_search(text):
+        if not is_trust_engine_call and not web_content and needs_web_search(text):
             app.logger.info("Chat message needs a web search; asking the client to search with its own browser.")
             search_query = resolve_search_query(text, session_id)
             return jsonify({"needs_web_search": True, "search_query": search_query}), 200
