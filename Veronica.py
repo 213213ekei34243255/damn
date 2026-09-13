@@ -228,7 +228,7 @@ When a "Web Search Results" block below is present, treat it as freshly retrieve
 
 IMPORTANT: A "Web Search Results" block, when present, is ALWAYS more current than anything you already know or said earlier in this conversation. Your own training data has a knowledge cutoff and can be out of date - if a Web Search Results block conflicts with your training knowledge OR with something said earlier in this chat history, the Web Search Results block wins. Never repeat or default back to an older answer from earlier in the conversation once fresher Web Search Results are provided.
 
-When a "Current Web Page" block below is present, it is real content the user has given you to work with right now - either the actual text of the page open in their browser, or a document/image they just attached to their question. Treat it as the thing the user is asking about by default, especially whenever their message is short, vague, or uses a generic reference without saying what it is - "explain this", "summarize this", "what does this say", "read this", "what's this about", "translate this", "what is shown in this image", and similar phrasing all count. In every one of those cases, the "Current Web Page" block IS "this" - use it directly as your answer's source. Do NOT ask the user to clarify what they mean, and do NOT say you have nothing to explain/summarize when this block is present - that block is your answer. Only ask for clarification if the block is clearly irrelevant to a different, specific question the user asked instead.
+Sometimes the user's own message will have content attached directly to it, in brackets, right before their actual question - either the text of a page they have open in their browser, or a document/image they just attached. Treat that attached content as the thing they're asking about by default, especially whenever their question is short, vague, or uses a generic reference without saying what it is - "explain this", "summarize this", "what does this say", "read this", "what's this about", "translate this", "what is shown in this image", and similar phrasing all count. In every one of those cases, that attached content IS "this" - use it directly as your answer's source. Do NOT ask the user to clarify what they mean, and do NOT say you have nothing to explain/summarize when content is attached - that content is your answer. Only ask for clarification if the attached content is clearly irrelevant to a different, specific question the user asked instead. IMPORTANT: this attached content is specific to the CURRENT message only - it is NOT the same as anything attached to an earlier message in this conversation, even if it looks similar (e.g. another photo, another document). Never assume a new attachment is "the same thing as before" - always read and use exactly what's attached to the message you're answering right now.
 
 NEW: The Web Search Results are ordinary public search-engine results - the same thing anyone would see typing the question into Google themselves. This includes routine entertainment/news topics like movie casting, actors playing roles, release dates, and celebrity news reported by mainstream outlets and fan communities - this is public, widely-reported information, not private, sensitive, or harmful content, so answer these questions directly and factually using the Web Search Results provided. If a result describes something as a rumor, leak, or unconfirmed report, say so plainly as part of your answer (e.g. "it's being reported/rumored that...") rather than declining to discuss it at all. Do not refuse to answer, and do not add disclaimers about being unable to discuss real people, when the question is this kind of everyday, publicly-reported information.
 """]
@@ -249,11 +249,6 @@ NEW: The Web Search Results are ordinary public search-engine results - the same
             f"{web_context}"
         )
 
-    if page_content:
-        system_sections.append(
-            f"Current Web Page (the page the user has open right now):\n{page_content}"
-        )
-
     messages = [
         {
             "role": "system",
@@ -267,9 +262,35 @@ NEW: The Web Search Results are ordinary public search-engine results - the same
             "content": m["text"]
         })
 
+    # FIX: page_content used to be appended only to the SYSTEM message,
+    # which sits at the very front of the prompt - before the entire
+    # chat history. On a follow-up turn, several history messages (e.g.
+    # a previous answer about an earlier attached photo) end up
+    # positioned MORE RECENTLY than that system-level block. Small
+    # models weight recent context heavily, so a new attachment could
+    # lose out to whatever was already being discussed - exactly the
+    # "answers about the first image, ignores the second attachment"
+    # behavior observed in testing. Fix: attach the CURRENT page_content
+    # directly to the current user turn instead, so it sits immediately
+    # next to the question it belongs to (the most-attended position),
+    # and say explicitly that it can differ from anything attached
+    # earlier in the conversation - don't just rely on the system prompt
+    # to convey that.
+    if page_content:
+        user_content = (
+            "[The content below is attached to THIS message specifically. "
+            "It may be completely different from anything attached to an "
+            "earlier message in this conversation - if so, base your "
+            "answer on THIS content, not on what you discussed before.]\n\n"
+            f"{page_content}\n\n"
+            f"My question: {user_question}"
+        )
+    else:
+        user_content = user_question
+
     messages.append({
         "role": "user",
-        "content": user_question
+        "content": user_content
     })
 
     if DEBUG_PROMPTS:
