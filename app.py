@@ -3,6 +3,7 @@ from Veronica import get_veronica_response, load_knowledge_base, save_knowledge_
 from flask_cors import CORS
 import os
 from agent import get_agent_plan, needs_page_content
+from media_source_finder import analyze_image as media_source_analyze_image
 import google.generativeai as genai
 import re
 import logging
@@ -454,6 +455,44 @@ def predict():
     except Exception:
         app.logger.exception("Error in /predict")
         return jsonify({"error": "An unexpected error occurred."}), 500
+
+
+@app.route("/media-source/image", methods=["POST"])
+def media_source_image():
+    """
+    Image-mode Media Source Finder (Phase 1). Accepts multipart form
+    data: `image` (the resized JPEG from the client), `ocr_text` (the
+    on-device Vision OCR result), `candidates` (a JSON array of
+    {"url", "contextLink", "title"} from the client's existing
+    GoogleSearchService.searchImages() keyword search - see
+    MediaSourceFinderService.swift for why discovery happens there
+    rather than here). Never fabricates a source - see
+    media_source_finder.py's docstring for exactly which models are
+    real vs. disabled and why.
+    """
+    try:
+        image_file = request.files.get("image")
+        if not image_file:
+            return jsonify({"error": "Missing image."}), 400
+
+        ocr_text = request.form.get("ocr_text", "")
+
+        candidates = []
+        candidates_raw = request.form.get("candidates", "[]")
+        try:
+            parsed = json.loads(candidates_raw)
+            if isinstance(parsed, list):
+                candidates = parsed
+        except json.JSONDecodeError:
+            app.logger.warning("media-source/image: could not parse candidates JSON")
+
+        image_bytes = image_file.read()
+        result = media_source_analyze_image(image_bytes, ocr_text, candidates)
+        return jsonify(result), 200
+
+    except Exception:
+        app.logger.exception("Error in /media-source/image")
+        return jsonify({"error": "An unexpected error occurred analyzing that image."}), 500
 
 
 @app.route('/export_conversations', methods=['GET'])
