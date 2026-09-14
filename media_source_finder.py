@@ -54,7 +54,9 @@ hiding a broken integration.
 """
 
 import base64
+import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -65,6 +67,14 @@ from typing import Optional
 import requests
 from PIL import Image
 import imagehash
+
+# Reused for a cross-worker audio-result cache (see _get_cached_audio_
+# result/_cache_audio_result below) - this backend already runs Redis
+# for Veronica.py's chat history, so no new infrastructure is needed.
+# If Redis itself is ever unreachable, every cache read/write is
+# wrapped in a try/except that just skips caching - it degrades to
+# "call the provider every time" rather than breaking audio ID.
+from Veronica import redis_client
 
 try:
     import acoustid
@@ -753,24 +763,49 @@ def _identify_via_acoustid(audio_bytes: bytes) -> Optional[dict]:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
 
-        # force_fpcalc=True: the Dockerfile only installs the fpcalc
-        # CLI tool, not the Chromaprint dynamic library pyacoustid would
+        # Calling fingerprint_file() + lookup() directly instead of the
+        # higher-level acoustid.match() - match()'s own result parser
+        # (parse_lookup_result) throws away AcoustID's actual error
+        # detail on failure and raises WebServiceError("status: error"),
+        # which tells us nothing. Doing it ourselves means a real
+        # error.code/error.message from AcoustID's response shows up in
+        # the logs instead of that useless generic string.
+        #
+        # force_fpcalc=True: the Dockerfile only installs the fpcalc CLI
+        # tool, not the Chromaprint dynamic library pyacoustid would
         # otherwise prefer - forcing fpcalc avoids depending on a
         # library that isn't actually installed.
+        duration, fingerprint = acoustid.fingerprint_file(tmp_path, force_fpcalc=True)
+        response = acoustid.lookup(ACOUSTID_API_KEY, fingerprint, duration, meta="recordings")
+
+        if response.get("status") != "ok":
+            error = response.get("error") or {}
+            logger.warning(
+                "[media-source] AcoustID lookup rejected the request - code=%s message=%r (full response=%s). "
+                "If message mentions an invalid/unknown key, this is very likely a personal ACCOUNT key rather "
+                "than an APPLICATION key - AcoustID requires an application key (acoustid.org/api-key -> "
+                "'Register a new application') for lookups specifically.",
+                error.get("code"), error.get("message"), response,
+            )
+            return None
+
         best = None
-        for score, recording_id, title, artist in acoustid.match(
-            ACOUSTID_API_KEY, tmp_path, force_fpcalc=True
-        ):
-            if not title:
-                continue
-            if best is None or score > best[0]:
-                best = (score, recording_id, title, artist)
+        for r in response.get("results") or []:
+            score = r.get("score", 0)
+            for recording in r.get("recordings") or []:
+                title = recording.get("title")
+                if not title:
+                    continue
+                artists = recording.get("artists") or []
+                artist = ", ".join(a.get("name") for a in artists if a.get("name")) or None
+                if best is None or score > best[0]:
+                    best = (score, title, artist)
 
         if best is None or best[0] < ACOUSTID_MIN_SCORE:
             logger.info("[media-source] AcoustID processed the audio - no confident match (best=%s)", best)
             return _empty_audio_result("not_found")
 
-        score, recording_id, title, artist = best
+        score, title, artist = best
         logger.info("[media-source] AcoustID identified: %s - %s (score=%.2f)", artist, title, score)
         return {
             "outcome": "identified",
@@ -847,30 +882,89 @@ def _identify_via_audd(audio_bytes: bytes) -> dict:
     }
 
 
+# --------------------------------------------------------------------
+# Audio result cache - the actual "don't exhaust the free plan" tweak.
+# Keyed by a SHA-256 of the raw audio bytes, so the exact same clip
+# (submitted twice during testing, or uploaded by many different users
+# if something goes viral) never triggers a second AcoustID/AudD call.
+# Backed by the Redis instance this app already runs for Veronica.py's
+# chat history - a plain in-process dict wouldn't help much here, since
+# Gunicorn runs multiple worker processes (WEB_CONCURRENCY) that don't
+# share memory, so a repeat request could easily land on a different
+# worker than the one that saw it first. Redis is shared across all of
+# them.
+#
+# "identified" results are cached for a long time (30 days) - a song's
+# identity is a fact that doesn't change. "not_found" results are
+# cached for a much shorter time (1 day) - that outcome depends on
+# which providers are configured and their current database coverage,
+# both of which CAN change (e.g. you add AUDD_API_TOKEN later), so a
+# stale "not_found" shouldn't stick around too long. "not_configured"
+# is never cached at all - it reflects your server's current setup,
+# not anything about the audio itself.
+# --------------------------------------------------------------------
+
+_AUDIO_CACHE_TTL_IDENTIFIED_S = 30 * 24 * 60 * 60
+_AUDIO_CACHE_TTL_NOT_FOUND_S = 1 * 24 * 60 * 60
+
+
+def _audio_cache_key(audio_bytes: bytes) -> str:
+    return "media-source:audio:" + hashlib.sha256(audio_bytes).hexdigest()
+
+
+def _get_cached_audio_result(audio_bytes: bytes) -> Optional[dict]:
+    try:
+        raw = redis_client.get(_audio_cache_key(audio_bytes))
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        logger.info("[media-source] audio cache read failed (continuing without cache): %s", e)
+        return None
+
+
+def _cache_audio_result(audio_bytes: bytes, result: dict) -> None:
+    ttl = _AUDIO_CACHE_TTL_IDENTIFIED_S if result["outcome"] == "identified" else _AUDIO_CACHE_TTL_NOT_FOUND_S
+    try:
+        redis_client.setex(_audio_cache_key(audio_bytes), ttl, json.dumps(result))
+    except Exception as e:
+        logger.info("[media-source] audio cache write failed (continuing without cache): %s", e)
+
+
 def identify_audio(audio_bytes: bytes) -> dict:
     """
     Returns a dict with `outcome` of "identified" / "not_found" /
     "not_configured" - matches iOS's AudioIdentificationResult exactly.
 
-    Tries AcoustID (free) first, then AudD (paid) if AcoustID isn't
-    configured or didn't find anything. "not_configured" and
-    "not_found" are DELIBERATELY distinct and must never be blurred
-    into the same UI message: not_configured means NEITHER provider is
-    set up at all, while not_found means at least one of them actually
-    analyzed the audio and found no fingerprint match - which is also
-    the CORRECT, expected outcome for speech, traffic, wind, or any
-    non-music recording, since both providers' databases are music-
-    specific.
+    Checks the Redis-backed result cache first (see the block above) -
+    a cache hit means NO provider call happens at all, which is the
+    actual mechanism that keeps repeated/duplicate lookups from eating
+    into a free-tier quota. On a miss, tries AcoustID (free) first,
+    then AudD (paid) if AcoustID isn't configured or didn't find
+    anything. "not_configured" and "not_found" are DELIBERATELY
+    distinct and must never be blurred into the same UI message:
+    not_configured means NEITHER provider is set up at all, while
+    not_found means at least one of them actually analyzed the audio
+    and found no fingerprint match - which is also the CORRECT,
+    expected outcome for speech, traffic, wind, or any non-music
+    recording, since both providers' databases are music-specific.
     """
+    cached = _get_cached_audio_result(audio_bytes)
+    if cached is not None:
+        logger.info("[media-source] audio result served from cache (outcome=%s) - no provider call made", cached.get("outcome"))
+        return cached
+
     acoustid_result = _identify_via_acoustid(audio_bytes)
     if acoustid_result is not None and acoustid_result["outcome"] == "identified":
-        return acoustid_result
+        result = acoustid_result
+    else:
+        audd_result = _identify_via_audd(audio_bytes)
+        if audd_result["outcome"] == "identified":
+            result = audd_result
+        elif acoustid_result is not None or audd_result["outcome"] != "not_configured":
+            result = _empty_audio_result("not_found")
+        else:
+            logger.info("[media-source] neither ACOUSTID_API_KEY nor AUDD_API_TOKEN is set - audio identification not configured")
+            result = _empty_audio_result("not_configured")
 
-    audd_result = _identify_via_audd(audio_bytes)
-    if audd_result["outcome"] == "identified":
-        return audd_result
-
-    if acoustid_result is not None or audd_result["outcome"] != "not_configured":
-        return _empty_audio_result("not_found")
-    logger.info("[media-source] neither ACOUSTID_API_KEY nor AUDD_API_TOKEN is set - audio identification not configured")
-    return _empty_audio_result("not_configured")
+    if result["outcome"] != "not_configured":
+        _cache_audio_result(audio_bytes, result)
+    return result
